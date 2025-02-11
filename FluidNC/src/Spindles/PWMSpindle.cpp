@@ -42,6 +42,7 @@ namespace Spindles {
             linearSpeeds(10000, 100.0f);
         }
         setupSpeeds(_pwm->period());
+        init_atc();
         config_message();
     }
 
@@ -57,7 +58,7 @@ namespace Spindles {
         }
 
         if (!_output_pin.defined()) {
-            log_warn(name() << " spindle output_pin not defined");
+            log_config_error(name() << " spindle output_pin not defined");
         }
 
         // We always use mapSpeed() with the unmodified input speed so it sets
@@ -92,7 +93,7 @@ namespace Spindles {
     // prints the startup message of the spindle config
     void PWM::config_message() {
         log_info(name() << " Spindle Ena:" << _enable_pin.name() << " Out:" << _output_pin.name() << " Dir:" << _direction_pin.name()
-                        << " Freq:" << _pwm->frequency() << "Hz Period:" << _pwm->period()
+                        << " Freq:" << _pwm->frequency() << "Hz Period:" << _pwm->period() << atc_info()
 
         );
     }

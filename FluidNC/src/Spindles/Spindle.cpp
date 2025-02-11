@@ -7,14 +7,29 @@
 #include "Spindle.h"
 
 #include "../System.h"  //sys.spindle_speed_ovr
-#include <esp32-hal.h>  // delay()
+#include "src/UartChannel.h"
 
 Spindles::Spindle* spindle = nullptr;
 
 namespace Spindles {
     // ========================= Spindle ==================================
 
-    void Spindle::switchSpindle(uint32_t new_tool, SpindleList spindles, Spindle*& spindle) {
+    void Spindle::init_atc() {
+        ATCs::ATC* candidate = nullptr;
+        auto       atcs      = ATCs::ATCFactory::objects();
+        for (auto a : atcs) {
+            if (_atc_name == a->name()) {
+                _atc      = a;
+                _atc_info = " with " + _atc_name;
+                return;
+            }
+        }
+        if (!_m6_macro._gcode.empty()) {
+            _atc_info = " with m6_macro";
+        }
+    }
+
+    void Spindle::switchSpindle(uint32_t new_tool, SpindleList spindles, Spindle*& spindle, bool& stop_spindle, bool& new_spindle) {
         // Find the spindle whose tool number is closest to and below the new tool number
         Spindle* candidate = nullptr;
         for (auto s : spindles) {
@@ -23,11 +38,15 @@ namespace Spindles {
             }
         }
         if (candidate) {
-            if (candidate != spindle) {
-                if (spindle != nullptr) {
-                    spindle->stop();
-                }
-                spindle = candidate;
+            if (spindle != nullptr) {
+                spindle->stop();      // stop the current spindle
+                stop_spindle = true;  // used to stop the next spindle
+            }
+            if (candidate != spindle) {  // we are changing spindles
+                gc_state.selected_tool = new_tool;
+                spindle                = candidate;
+                new_spindle            = true;
+                log_info("Changed to spindle:" << spindle->name());
             }
         } else {
             if (spindle == nullptr) {
@@ -38,7 +57,6 @@ namespace Spindles {
                 spindle = spindles[0];
             }
         }
-        log_info("Using spindle " << spindle->name());
     }
 
     bool Spindle::isRateAdjusted() {
@@ -79,6 +97,12 @@ namespace Spindles {
         _speeds[i].scale  = scaler;
     }
 
+    void Spindle::validate() {
+        for (auto s : Spindles::SpindleFactory::objects()) {
+            Assert(s == this || s->_tool != _tool, "Duplicate tool_number %d with /%s", _tool, s->name());
+        }
+    }
+
     void Spindle::afterParse() {
         if (_speeds.size() && !maxSpeed()) {
             log_error("Speed map max speed is 0. Using default");
@@ -101,6 +125,30 @@ namespace Spindles {
             _speeds.push_back({ min, minPercent });
         }
         _speeds.push_back({ max, 100.0f });
+    }
+
+    // pre_select is generally ignored except for machines that need to get a tool ready
+    // set_tool is just used to tell the atc what is already installed.
+    bool Spindle::tool_change(uint32_t tool_number, bool pre_select, bool set_tool) {
+        if (_atc != NULL) {
+            log_info(_name << " spindle changed to tool:" << tool_number << " using " << _atc_name);
+            return _atc->tool_change(tool_number, pre_select, set_tool);
+        }
+        if (!_m6_macro.get().empty()) {
+            if (pre_select) {
+                return true;
+            }
+            _last_tool = tool_number;
+            if (set_tool) {
+                return true;
+            }
+            _m6_macro.run(nullptr);
+            _last_tool = tool_number;
+            return true;
+            //}
+        }
+
+        return true;
     }
 
     uint32_t Spindle::maxSpeed() {
@@ -206,10 +254,10 @@ namespace Spindles {
                 }
         }
         if (down) {
-            delay(down < maxSpeed() ? _spindown_ms * down / maxSpeed() : _spindown_ms);
+            dwell_ms(down < maxSpeed() ? _spindown_ms * down / maxSpeed() : _spindown_ms, DwellMode::SysSuspend);
         }
         if (up) {
-            delay(up < maxSpeed() ? _spinup_ms * up / maxSpeed() : _spinup_ms);
+            dwell_ms(up < maxSpeed() ? _spinup_ms * up / maxSpeed() : _spinup_ms, DwellMode::SysSuspend);
         }
         _current_state = state;
         _current_speed = speed;

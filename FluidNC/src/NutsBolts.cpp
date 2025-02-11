@@ -15,61 +15,8 @@
 
 const int MAX_INT_DIGITS = 8;  // Maximum number of digits in int32 (and float)
 
-// Extracts a floating point value from a string. The following code is based loosely on
-// the avr-libc strtod() function by Michael Stumpf and Dmitry Xmelkov and many freely
-// available conversion method examples, but has been highly optimized for Grbl. For known
-// CNC applications, the typical decimal value is expected to be in the range of E0 to E-4.
-// Scientific notation is officially not supported by g-code, and the 'E' character may
-// be a g-code word on some CNC systems. So, 'E' notation will not be recognized.
-// NOTE: Thanks to Radu-Eosif Mihailescu for identifying the issues with using strtod().
-bool read_float(const char* line, size_t* char_counter, float* float_ptr) {
-    const char*   ptr = line + *char_counter;
-    unsigned char c;
-    // Grab first character and increment pointer. No spaces assumed in line.
-    c = *ptr++;
-    // Capture initial positive/minus character
-    bool isnegative = false;
-    if (c == '-') {
-        isnegative = true;
-        c          = *ptr++;
-    } else if (c == '+') {
-        c = *ptr++;
-    }
-
-    // Extract number into fast integer. Track decimal in terms of exponent value.
-    uint32_t intval    = 0;
-    int8_t   exp       = 0;
-    size_t   ndigit    = 0;
-    bool     isdecimal = false;
-    while (1) {
-        c -= '0';
-        if (c <= 9) {
-            ndigit++;
-            if (ndigit <= MAX_INT_DIGITS) {
-                if (isdecimal) {
-                    exp--;
-                }
-                intval = intval * 10 + c;
-            } else {
-                if (!(isdecimal)) {
-                    exp++;  // Drop overflow digits
-                }
-            }
-        } else if (c == (('.' - '0') & 0xff) && !(isdecimal)) {
-            isdecimal = true;
-        } else {
-            break;
-        }
-        c = *ptr++;
-    }
-    // Return if no digits have been read.
-    if (!ndigit) {
-        return false;
-    }
-
-    // Convert integer into floating point.
-    float fval;
-    fval = (float)intval;
+static float uint_to_float(uint32_t intval, int exp) {
+    float fval = (float)intval;
     // Apply decimal. Should perform no more than two floating point multiplications for the
     // expected range of E0 to E-4.
     if (fval != 0) {
@@ -85,22 +32,77 @@ bool read_float(const char* line, size_t* char_counter, float* float_ptr) {
             } while (--exp > 0);
         }
     }
-    // Assign floating point value with correct sign.
-    if (isnegative) {
-        *float_ptr = -fval;
-    } else {
-        *float_ptr = fval;
+    return fval;
+}
+
+// Extracts a floating point value from a string. The following code is based loosely on
+// the avr-libc strtod() function by Michael Stumpf and Dmitry Xmelkov and many freely
+// available conversion method examples, but has been highly optimized for Grbl. For known
+// CNC applications, the typical decimal value is expected to be in the range of E0 to E-4.
+// Scientific notation is officially not supported by g-code, and the 'E' character may
+// be a g-code word on some CNC systems. So, 'E' notation will not be recognized.
+// NOTE: Thanks to Radu-Eosif Mihailescu for identifying the issues with using strtod().
+bool read_float(const char* line, size_t& pos, float& result) {
+    const char* ptr = line + pos;
+
+    // Line is assumed to have no spaces
+
+    // Capture initial positive/minus character
+    char c          = *ptr;
+    bool isnegative = false;
+    if (c == '-') {
+        ++ptr;
+        isnegative = true;
+    } else if (c == '+') {
+        ++ptr;
     }
-    *char_counter = ptr - line - 1;  // Set char_counter to next statement
+
+    // Extract number into fast integer. Track decimal in terms of exponent value.
+    uint32_t intval    = 0;
+    int8_t   exp       = 0;
+    size_t   ndigit    = 0;
+    bool     isdecimal = false;
+    while (1) {
+        c = *ptr;
+        if (isdigit(c)) {
+            ++ptr;
+            ndigit++;
+            if (ndigit <= MAX_INT_DIGITS) {
+                if (isdecimal) {
+                    exp--;
+                }
+                intval = intval * 10 + c - '0';
+            } else {
+                if (!(isdecimal)) {
+                    exp++;  // Drop overflow digits
+                }
+            }
+        } else if (c == '.' && !(isdecimal)) {
+            ++ptr;
+            isdecimal = true;
+        } else {
+            break;
+        }
+    }
+    // Return if no digits have been read.
+    if (!ndigit) {
+        return false;
+    }
+
+    float fval = uint_to_float(intval, exp);
+
+    result = isnegative ? -fval : fval;
+
+    pos = ptr - line;  // Set pos to next statement
     return true;
 }
 
-void delay_ms(uint16_t ms) {
+void delay_ms(uint32_t ms) {
     vTaskDelay(ms / portTICK_PERIOD_MS);
 }
 
 // Non-blocking delay function used for general operation and suspend features.
-bool delay_msec(uint32_t milliseconds, DwellMode mode) {
+bool dwell_ms(uint32_t milliseconds, DwellMode mode) {
     while (milliseconds--) {
         if (mode == DwellMode::Dwell) {
             protocol_execute_realtime();
@@ -114,7 +116,7 @@ bool delay_msec(uint32_t milliseconds, DwellMode mode) {
         if (sys.abort) {
             return false;
         }
-        vTaskDelay(1 / portTICK_PERIOD_MS);
+        delay_ms(1);
     }
     return true;
 }
@@ -149,7 +151,7 @@ void scale_vector(float* v, float scale, size_t n) {
 }
 
 float convert_delta_vector_to_unit_vector(float* v) {
-    auto  n_axis    = config->_axes->_numberAxis;
+    auto  n_axis    = Axes::_numberAxis;
     float magnitude = vector_length(v, n_axis);
     scale_vector(v, 1.0f / magnitude, n_axis);
     return magnitude;
@@ -159,9 +161,9 @@ const float secPerMinSq = 60.0 * 60.0;  // Seconds Per Minute Squared, for accel
 
 float limit_acceleration_by_axis_maximum(float* unit_vec) {
     float limit_value = SOME_LARGE_VALUE;
-    auto  n_axis      = config->_axes->_numberAxis;
+    auto  n_axis      = Axes::_numberAxis;
     for (size_t idx = 0; idx < n_axis; idx++) {
-        auto axisSetting = config->_axes->_axis[idx];
+        auto axisSetting = Axes::_axis[idx];
         if (unit_vec[idx] != 0) {  // Avoid divide by zero.
             limit_value = MIN(limit_value, fabsf(axisSetting->_acceleration / unit_vec[idx]));
         }
@@ -175,9 +177,9 @@ float limit_acceleration_by_axis_maximum(float* unit_vec) {
 
 float limit_rate_by_axis_maximum(float* unit_vec) {
     float limit_value = SOME_LARGE_VALUE;
-    auto  n_axis      = config->_axes->_numberAxis;
+    auto  n_axis      = Axes::_numberAxis;
     for (size_t idx = 0; idx < n_axis; idx++) {
-        auto axisSetting = config->_axes->_axis[idx];
+        auto axisSetting = Axes::_axis[idx];
         if (unit_vec[idx] != 0) {  // Avoid divide by zero.
             limit_value = MIN(limit_value, fabsf(axisSetting->_maxRate / unit_vec[idx]));
         }

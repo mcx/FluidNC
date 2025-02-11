@@ -1,12 +1,10 @@
 #pragma once
 
-#include "Config.h"
-#include "Configuration/Configurable.h"
-#include "Channel.h"
+#include "src/Config.h"
+#include "src/Module.h"
+#include "src/Channel.h"
 
-typedef const uint8_t* font_t;
-
-class Status_Outputs : public Channel, public Configuration::Configurable {
+class Status_Outputs : public Channel, public ConfigurableModule {
     Pin _Idle_pin;
     Pin _Run_pin;
     Pin _Hold_pin;
@@ -23,21 +21,21 @@ private:
     void parse_status_report();
 
 public:
-    Status_Outputs() : Channel("status_outputs") {}
+    Status_Outputs(const char* name) : Channel(name), ConfigurableModule(name) {}
 
-    Status_Outputs(const Status_Outputs&) = delete;
-    Status_Outputs(Status_Outputs&&)      = delete;
+    Status_Outputs(const Status_Outputs&)            = delete;
+    Status_Outputs(Status_Outputs&&)                 = delete;
     Status_Outputs& operator=(const Status_Outputs&) = delete;
-    Status_Outputs& operator=(Status_Outputs&&) = delete;
+    Status_Outputs& operator=(Status_Outputs&&)      = delete;
 
     virtual ~Status_Outputs() = default;
 
-    void init();
+    void init() override;
 
     size_t write(uint8_t data) override;
 
-    Channel* pollLine(char* line) override;
-    void     flushRx() override {}
+    Error pollLine(char* line) override;
+    void  flushRx() override {}
 
     bool   lineComplete(char*, char) override { return false; }
     size_t timedReadBytes(char* buffer, size_t length, TickType_t timeout) override { return 0; }

@@ -41,13 +41,11 @@
 #include "../Pin.h"
 #include "../Limits.h"  // limitsMaxPosition
 
-#include <freertos/task.h>  // vTaskDelay
-
 namespace MotorDrivers {
 
     void Solenoid::init() {
         if (_output_pin.undefined()) {
-            log_warn("    Solenoid disabled: No output pin");
+            log_config_error("    Solenoid disabled: No output pin");
             _has_errors = true;
             return;  // We cannot continue without the output pin
         }
@@ -67,7 +65,9 @@ namespace MotorDrivers {
         schedule_update(this, _update_rate_ms);
     }
 
-    void Solenoid::update() { set_location(); }
+    void Solenoid::update() {
+        set_location();
+    }
 
     void Solenoid::config_message() {
         log_info("    " << name() << " Pin: " << _output_pin.name() << " Off: " << _off_percent << " Hold: " << _hold_percent << " Pull:"

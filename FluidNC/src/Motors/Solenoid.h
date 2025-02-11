@@ -10,7 +10,7 @@ namespace MotorDrivers {
         void config_message() override;
         void update() override;
 
-        const uint8_t _update_rate_ms = 50;
+        static constexpr uint8_t _update_rate_ms = 50;
 
         float    _off_percent  = 0.0;
         float    _pull_percent = 100.0;
@@ -31,7 +31,7 @@ namespace MotorDrivers {
         SolenoidMode _current_mode = SolenoidMode::Off;
 
     public:
-        Solenoid() = default;
+        Solenoid(const char* name) : RcServo(name) {}
 
         void set_location();
         void init() override;
@@ -52,8 +52,5 @@ namespace MotorDrivers {
 
             Servo::group(handler);
         }
-
-        // Name of the configurable. Must match the name registered in the cpp file.
-        const char* name() const override { return "solenoid"; }
     };
 }

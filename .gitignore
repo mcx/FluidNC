@@ -21,6 +21,7 @@ FluidNC.vcxproj.filters
 *.suo
 packages/
 pio_machine.h
+platformio_override.ini
 project.checksum
 version.cpp
 esptool*.zip
@@ -31,3 +32,7 @@ dist/
 *.cppx
 *.hx
 /compile_commands.json
+data-wmb/
+*#
+/gcode_tests/venv
+release/

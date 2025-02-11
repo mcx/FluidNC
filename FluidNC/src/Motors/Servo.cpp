@@ -19,12 +19,8 @@
 #include "../Machine/MachineConfig.h"
 
 #include <atomic>
-#include <freertos/task.h>  // portTICK_PERIOD_MS, vTaskDelay
 
 namespace MotorDrivers {
-
-    Servo::Servo() : MotorDriver() {}
-
     void Servo::update_servo(TimerHandle_t timer) {
         Servo* servo = static_cast<Servo*>(pvTimerGetTimerID(timer));
         servo->update();

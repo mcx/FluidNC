@@ -42,10 +42,18 @@ namespace Configuration {
     }
 
     // String values might have meaningful leading and trailing spaces so we avoid trimming the string (false)
-    std::string_view Parser::stringValue() const { return _token._value; }
 
-    bool Parser::boolValue() const { return string_util::equal_ignore_case(string_util::trim(_token._value), "true"); }
+    // cppcheck-suppress unusedFunction
+    std::string_view Parser::stringValue() const {
+        return _token._value;
+    }
 
+    // cppcheck-suppress unusedFunction
+    bool Parser::boolValue() const {
+        return string_util::equal_ignore_case(string_util::trim(_token._value), "true");
+    }
+
+    // cppcheck-suppress unusedFunction
     int Parser::intValue() const {
         auto    value_token = string_util::trim(_token._value);
         int32_t int_value;
@@ -80,6 +88,7 @@ namespace Configuration {
         return 0;
     }
 
+    // cppcheck-suppress unusedFunction
     float Parser::floatValue() const {
         auto  token = string_util::trim(_token._value);
         float float_value;
@@ -90,6 +99,7 @@ namespace Configuration {
         return NAN;
     }
 
+    // cppcheck-suppress unusedFunction
     std::vector<speedEntry> Parser::speedEntryValue() const {
         auto str = string_util::trim(_token._value);
 
@@ -132,8 +142,41 @@ namespace Configuration {
         return speed_entries;
     }
 
-    Pin Parser::pinValue() const { return Pin::create(string_util::trim(_token._value)); }
+    std::vector<float> Parser::floatArray() const {
+        auto               str = string_util::trim(_token._value);
+        std::vector<float> values;
+        float              float_value;
 
+        while (!str.empty()) {
+            str                = string_util::trim(str);
+            auto next_ws_delim = str.find(' ');
+            auto entry_str     = string_util::trim(str.substr(0, next_ws_delim));
+
+            str.remove_prefix(next_ws_delim + 1);
+
+            if (!string_util::is_float(entry_str, float_value)) {
+                log_error("Bad number " << entry_str);
+                values.clear();
+                break;
+            }
+            values.push_back(float_value);
+
+            if (str == entry_str)
+                break;
+        }
+
+        if (!values.size())
+            log_info("Using default value");
+
+        return values;
+    }
+
+    // cppcheck-suppress unusedFunction
+    Pin Parser::pinValue() const {
+        return Pin::create(string_util::trim(_token._value));
+    }
+
+    // cppcheck-suppress unusedFunction
     IPAddress Parser::ipValue() const {
         IPAddress ip;
         if (!ip.fromString(std::string(string_util::trim(_token._value)).c_str())) {
@@ -142,7 +185,8 @@ namespace Configuration {
         return ip;
     }
 
-    int Parser::enumValue(EnumItem* e) const {
+    // cppcheck-suppress unusedFunction
+    int Parser::enumValue(const EnumItem* e) const {
         auto token = string_util::trim(_token._value);
         for (; e->name; ++e) {
             if (string_util::equal_ignore_case(token, e->name)) {
@@ -152,6 +196,7 @@ namespace Configuration {
         return e->value;  // Terminal value is default.
     }
 
+    // cppcheck-suppress unusedFunction
     void Parser::uartMode(UartData& wordLength, UartParity& parity, UartStop& stopBits) const {
         auto str = string_util::trim(_token._value);
         if (str.length() == 5 || str.length() == 3) {

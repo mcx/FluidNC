@@ -12,7 +12,7 @@
 #include <iomanip>
 
 namespace Configuration {
-    JsonGenerator::JsonGenerator(WebUI::JSONencoder& encoder) : _encoder(encoder) {
+    JsonGenerator::JsonGenerator(JSONencoder& encoder) : _encoder(encoder) {
         std::atomic_thread_fence(std::memory_order::memory_order_seq_cst);
 
         _currentPath[0] = '\0';
@@ -68,7 +68,7 @@ namespace Configuration {
         leave();
     }
 
-    void JsonGenerator::item(const char* name, int& value, int32_t minValue, int32_t maxValue) {
+    void JsonGenerator::item(const char* name, int& value, const int32_t minValue, const int32_t maxValue) {
         enter(name);
         char buf[32];
         itoa(value, buf, 10);
@@ -77,7 +77,7 @@ namespace Configuration {
         leave();
     }
 
-    void JsonGenerator::item(const char* name, uint32_t& value, uint32_t minValue, uint32_t maxValue) {
+    void JsonGenerator::item(const char* name, uint32_t& value, const uint32_t minValue, const uint32_t maxValue) {
         enter(name);
         char buf[32];
         itoa(value, buf, 10);
@@ -86,7 +86,7 @@ namespace Configuration {
         leave();
     }
 
-    void JsonGenerator::item(const char* name, float& value, float minValue, float maxValue) {
+    void JsonGenerator::item(const char* name, float& value, const float minValue, const float maxValue) {
         enter(name);
         // WebUI does not explicitly recognize the R type, but nevertheless handles it correctly.
         if (value > 999999.999f) {
@@ -102,17 +102,25 @@ namespace Configuration {
     }
 
     void JsonGenerator::item(const char* name, std::vector<speedEntry>& value) {}
+    void JsonGenerator::item(const char* name, std::vector<float>& value) {}
+
     void JsonGenerator::item(const char* name, UartData& wordLength, UartParity& parity, UartStop& stopBits) {
         // Not sure if I should comment this out or not. The implementation is similar to the one in Generator.h.
     }
 
-    void JsonGenerator::item(const char* name, std::string& value, int minLength, int maxLength) {
+    void JsonGenerator::item(const char* name, std::string& value, const int minLength, const int maxLength) {
         enter(name);
         _encoder.begin_webui(_currentPath, _currentPath, "S", value.c_str(), minLength, maxLength);
         _encoder.end_object();
         leave();
     }
 
+    void JsonGenerator::item(const char* name, Macro& value) {
+        enter(name);
+        _encoder.begin_webui(_currentPath, _currentPath, "S", value.get().c_str(), 0, 255);
+        _encoder.end_object();
+        leave();
+    }
     void JsonGenerator::item(const char* name, Pin& value) {
         // We commented this out, because pins are very confusing for users. The code is correct,
         // but it really gives more support than it's worth.
@@ -132,7 +140,7 @@ namespace Configuration {
         leave();
     }
 
-    void JsonGenerator::item(const char* name, int& value, EnumItem* e) {
+    void JsonGenerator::item(const char* name, int& value, const EnumItem* e) {
         enter(name);
         int selected_val = 0;
         //const char* str          = "unknown";

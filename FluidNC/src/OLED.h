@@ -1,16 +1,18 @@
 #pragma once
 
-#include "Config.h"
+#include "src/Config.h"
 
-#include "Configuration/Configurable.h"
+#include "src/Configuration/Configurable.h"
 
-#include "Channel.h"
+#include "src/Channel.h"
+#include "src/Module.h"
 #include "SSD1306_I2C.h"
 
 typedef const uint8_t* font_t;
 
-class OLED : public Channel, public Configuration::Configurable {
+class OLED : public Channel, public ConfigurableModule {
 public:
+    OLED(const char* name) : Channel(name), ConfigurableModule(name) {}
     struct Layout {
         uint8_t                    _x;
         uint8_t                    _y;
@@ -79,16 +81,14 @@ private:
     bool _error = false;
 
 public:
-    OLED() : Channel("oled") {}
-
-    OLED(const OLED&) = delete;
-    OLED(OLED&&)      = delete;
+    OLED(const OLED&)            = delete;
+    OLED(OLED&&)                 = delete;
     OLED& operator=(const OLED&) = delete;
-    OLED& operator=(OLED&&) = delete;
+    OLED& operator=(OLED&&)      = delete;
 
     virtual ~OLED() = default;
 
-    void init();
+    void init() override;
 
     OLEDDisplay* _oled;
 
@@ -97,16 +97,17 @@ public:
     uint8_t _address = 0x3c;
     int     _width   = 64;
     int     _height  = 48;
+    bool    _flip    = true;
+    bool    _mirror  = false;
 
     // Channel method overrides
-
     size_t write(uint8_t data) override;
 
     int read(void) override { return -1; }
     int peek(void) override { return -1; }
 
-    Channel* pollLine(char* line) override;
-    void     flushRx() override {}
+    Error pollLine(char* line) override;
+    void  flushRx() override {}
 
     bool   lineComplete(char*, char) override { return false; }
     size_t timedReadBytes(char* buffer, size_t length, TickType_t timeout) override { return 0; }
@@ -122,6 +123,8 @@ public:
         handler.item("i2c_address", _address);
         handler.item("width", _width);
         handler.item("height", _height);
+        handler.item("flip", _flip);
+        handler.item("mirror", _mirror);
         handler.item("radio_delay_ms", _radio_delay);
     }
 };

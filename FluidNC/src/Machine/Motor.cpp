@@ -21,7 +21,7 @@ namespace Machine {
 
     void Motor::afterParse() {
         if (_driver == nullptr) {
-            _driver = new MotorDrivers::Nullmotor();
+            _driver = new MotorDrivers::Nullmotor("null_motor");
         }
     }
 
@@ -31,15 +31,13 @@ namespace Machine {
         }
         _driver->init();
 
-        _negLimitPin = new LimitPin(_negPin, _axis, _motorNum, -1, _hardLimits, _limited);
-        _posLimitPin = new LimitPin(_posPin, _axis, _motorNum, 1, _hardLimits, _limited);
-        _allLimitPin = new LimitPin(_allPin, _axis, _motorNum, 0, _hardLimits, _limited);
+        _negLimitPin = new LimitPin(_negPin, _axis, _motorNum, -1, _hardLimits);
+        _posLimitPin = new LimitPin(_posPin, _axis, _motorNum, 1, _hardLimits);
+        _allLimitPin = new LimitPin(_allPin, _axis, _motorNum, 0, _hardLimits);
 
         _negLimitPin->init();
         _posLimitPin->init();
         _allLimitPin->init();
-
-        unblock();
     }
 
     void Motor::config_motor() {
@@ -49,7 +47,9 @@ namespace Machine {
     }
 
     // true if there is at least one switch for this motor
-    bool Motor::hasSwitches() { return (_negPin.defined() || _posPin.defined() || _allPin.defined()); }
+    bool Motor::hasSwitches() {
+        return (_negPin.defined() || _posPin.defined() || _allPin.defined());
+    }
 
     // Used when a single switch input is wired to 2 axes.
     void Motor::makeDualSwitches() {
@@ -65,20 +65,11 @@ namespace Machine {
         _allLimitPin->setExtraMotorLimit(axis, _motorNum);
     }
 
-    bool Motor::isReal() { return _driver->isReal(); }
-
-    void IRAM_ATTR Motor::step(bool reverse) {
-        // Skip steps based on limit pins
-        // _blocked is for asymmetric pulloff
-        // _limited is for limit pins
-        if (_blocked || _limited) {
-            return;
-        }
-        _driver->step();
-        _steps += reverse ? -1 : 1;
+    bool Motor::isReal() {
+        return _driver->isReal();
     }
 
-    void IRAM_ATTR Motor::unstep() { _driver->unstep(); }
-
-    Motor::~Motor() { delete _driver; }
+    Motor::~Motor() {
+        delete _driver;
+    }
 }

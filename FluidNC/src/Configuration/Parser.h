@@ -19,7 +19,7 @@ namespace Configuration {
         void parseError(const char* description) const;
 
     public:
-        Parser(std::string_view yaml_string);
+        explicit Parser(std::string_view yaml_string);
 
         bool is(const char* expected);
 
@@ -28,9 +28,10 @@ namespace Configuration {
         int                     intValue() const;
         uint32_t                uintValue() const;
         std::vector<speedEntry> speedEntryValue() const;
+        std::vector<float>      floatArray() const;
         float                   floatValue() const;
         Pin                     pinValue() const;
-        int                     enumValue(EnumItem* e) const;
+        int                     enumValue(const EnumItem* e) const;
         IPAddress               ipValue() const;
         void                    uartMode(UartData& wordLength, UartParity& parity, UartStop& stopBits) const;
     };

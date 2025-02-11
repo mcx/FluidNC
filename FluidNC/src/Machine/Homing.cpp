@@ -1,9 +1,9 @@
 #include "Homing.h"
 
-#include "../System.h"                 // sys.*
-#include "../Stepper.h"                // st_wake
-#include "../Protocol.h"               // protocol_handle_events
-#include "../Limits.h"                 // ambiguousLimit
+#include "../System.h"    // sys.*
+#include "../Stepper.h"   // st_wake
+#include "../Protocol.h"  // protocol_handle_events
+#include "../Limits.h"    // ambiguousLimit
 #include "../Machine/Axes.h"
 #include "../Machine/MachineConfig.h"  // config
 
@@ -32,15 +32,18 @@ namespace Machine {
     const uint32_t MOTOR0 = 0xffff;
     const uint32_t MOTOR1 = 0xffff0000;
 
-    Homing::Phase   Homing::_phase       = Phase::None;
-    AxisMask        Homing::_cycleAxes   = 0;
-    AxisMask        Homing::_phaseAxes   = 0;
-    MotorMask       Homing::_cycleMotors = 0;
+    Homing::Phase   Homing::_phase         = Phase::None;
+    AxisMask        Homing::_cycleAxes     = 0;
+    AxisMask        Homing::_phaseAxes     = 0;
+    AxisMask        Homing::direction_mask = 0;
+    MotorMask       Homing::_cycleMotors   = 0;
     MotorMask       Homing::_phaseMotors;
     std::queue<int> Homing::_remainingCycles;
     uint32_t        Homing::_settling_ms;
 
-    AxisMask Homing::_unhomed_axes;  // Bitmap of axes whose position is unknown
+    uint32_t Homing::_runs;
+
+    AxisMask Homing::_unhomed_axes = 0;  // Bitmap of axes whose position is unknown
 
     bool Homing::axis_is_homed(size_t axis) {
         return bitnum_is_false(_unhomed_axes, axis);
@@ -52,7 +55,9 @@ namespace Machine {
         set_bitnum(_unhomed_axes, axis);
     }
     void Homing::set_all_axes_unhomed() {
-        _unhomed_axes = Machine::Axes::homingMask;
+        if (config->_start->_mustHome) {
+            _unhomed_axes = Machine::Axes::homingMask;
+        }
     }
     void Homing::set_all_axes_homed() {
         _unhomed_axes = 0;
@@ -68,7 +73,7 @@ namespace Machine {
 
     void Homing::startMove(AxisMask axisMask, MotorMask motors, Phase phase, uint32_t& settle_ms) {
         float rate;
-        float target[config->_axes->_numberAxis];
+        float target[Axes::_numberAxis];
         axisVector(_phaseAxes, _phaseMotors, _phase, target, rate, _settling_ms);
 
         plan_line_data_t plan_data      = {};
@@ -121,6 +126,15 @@ namespace Machine {
 
     void Homing::nextPhase() {
         _phase = static_cast<Phase>(static_cast<int>(_phase) + 1);
+
+        if (_phase == SlowApproach && _runs == 1) {
+            // If this is the last approach/pulloff run, skip past the Pulloff1 phase
+            _phase = Pulloff2;
+        } else if (_phase == Pulloff2 && --_runs > 1) {
+            // If we haven't done all of the runs, go back to the SlowApproach phase
+            _phase = SlowApproach;
+        }
+
         log_debug("Homing nextPhase " << phaseName(_phase));
         if (_phase == CycleDone || (_phase == Phase::Pulloff2 && !needsPulloff2(_cycleMotors))) {
             set_mpos();
@@ -163,6 +177,9 @@ namespace Machine {
 
             auto axisConfig = axes->_axis[axis];
             auto homing     = axisConfig->_homing;
+            if (!homing) {
+                continue;
+            }
 
             settle_ms = std::max(settle_ms, homing->_settle_ms);
 
@@ -185,11 +202,11 @@ namespace Machine {
                     travel    = axisConfig->extraPulloff();
                     if (travel < 0) {
                         // Motor0's pulloff is greater than motor1's, so we block motor1
-                        axisConfig->_motors[1]->block();
+                        Stepping::block(axis, 1);
                         travel = -travel;
                     } else if (travel > 0) {
                         // Motor1's pulloff is greater than motor0's, so we block motor0
-                        axisConfig->_motors[0]->block();
+                        Stepping::block(axis, 0);
                     }
                     // All motors will be unblocked later by set_homing_mode()
                     break;
@@ -256,9 +273,11 @@ namespace Machine {
 
                 auto paxis  = axes->_axis[axis];
                 auto homing = paxis->_homing;
-                auto scaler = approach ? (seeking ? homing->_seek_scaler : homing->_feed_scaler) : 1.0;
-                distance[axis] *= scaler;
-                target[axis] += distance[axis];
+                if (homing) {
+                    auto scaler = approach ? (seeking ? homing->_seek_scaler : homing->_feed_scaler) : 1.0;
+                    distance[axis] *= scaler;
+                    target[axis] += distance[axis];
+                }
             }
         }
 
@@ -302,7 +321,7 @@ namespace Machine {
             return;
         }
 
-        log_debug("Homing limited" << config->_axes->motorMaskToNames(limited));
+        log_debug("Homing limited" << Axes::motorMaskToNames(limited));
 
         bool stop = config->_kinematics->limitReached(_phaseAxes, _phaseMotors, limited);
 
@@ -313,7 +332,7 @@ namespace Machine {
             Stepper::reset();  // Stop moving
 
             if (_phaseAxes) {
-                log_debug("Homing replan with " << config->_axes->maskToNames(_phaseAxes));
+                log_debug("Homing replan with " << Axes::maskToNames(_phaseAxes));
 
                 config->_kinematics->releaseMotors(_phaseAxes, _phaseMotors);
 
@@ -341,17 +360,17 @@ namespace Machine {
         gc_sync_position();
         plan_sync_position();
 
-        config->_stepping->endLowLatency();
+        Stepping::endLowLatency();
 
         if (!sys.abort) {
-            sys.state = unhomed_axes() ? State::Alarm : State::Idle;
+            set_state(unhomed_axes() ? State::Alarm : State::Idle);
             Stepper::go_idle();  // Set steppers to the settings idle state before returning.
         }
     }
 
     void Homing::nextCycle() {
         // Start the next cycle in the queue
-        if (sys.state == State::Alarm) {
+        if (state_is(State::Alarm)) {
             while (!_remainingCycles.empty()) {
                 _remainingCycles.pop();
             }
@@ -364,20 +383,21 @@ namespace Machine {
         _cycleAxes = _remainingCycles.front();
         _remainingCycles.pop();
 
-        log_debug("Homing Cycle " << config->_axes->maskToNames(_cycleAxes));
+        log_debug("Homing Cycle " << Axes::maskToNames(_cycleAxes));
 
         _cycleAxes &= Machine::Axes::homingMask;
-        _cycleMotors = config->_axes->set_homing_mode(_cycleAxes, true);
+        _cycleMotors = Axes::set_homing_mode(_cycleAxes, true);
 
         _phase = Phase::PrePulloff;
+        _runs  = Axes::_homing_runs;
         runPhase();
     }
 
     void Homing::fail(ExecAlarm alarm) {
-        Stepper::reset();                                   // Stop moving
+        Stepper::reset();  // Stop moving
         send_alarm(alarm);
-        config->_axes->set_homing_mode(_cycleAxes, false);  // tell motors homing is done...failed
-        config->_axes->set_disable(config->_stepping->_idleMsecs != 255);
+        Axes::set_homing_mode(_cycleAxes, false);  // tell motors homing is done...failed
+        Axes::set_disable(Stepping::_idleMsecs != 255);
     }
 
     bool Homing::needsPulloff2(MotorMask motors) {
@@ -407,16 +427,21 @@ namespace Machine {
         auto axes   = config->_axes;
         auto n_axis = axes->_numberAxis;
 
-        float* mpos = get_mpos();
-
+        float*      mpos = get_mpos();
+        std::string homedAxes;
         log_debug("mpos was " << mpos[0] << "," << mpos[1] << "," << mpos[2]);
         // Replace coordinates homed axes with the homing values.
         for (size_t axis = 0; axis < n_axis; axis++) {
             if (bitnum_is_true(_cycleAxes, axis)) {
-                set_axis_homed(axis);
-                mpos[axis] = axes->_axis[axis]->_homing->_mpos;
+                auto homing = axes->_axis[axis]->_homing;
+                if (homing) {
+                    set_axis_homed(axis);
+                    mpos[axis] = homing->_mpos;
+                    homedAxes += axes->axisName(axis);
+                }
             }
         }
+        log_msg("Homed:" << homedAxes);
         log_debug("mpos becomes " << mpos[0] << "," << mpos[1] << "," << mpos[2]);
 
         set_motor_steps_from_mpos(mpos);
@@ -431,7 +456,7 @@ namespace Machine {
 #if 0
     static std::string axisNames(AxisMask axisMask) {
         std::string retval = "";
-        auto        n_axis = config->_axes->_numberAxis;
+        auto        n_axis = Axes::_numberAxis;
         for (size_t axis = 0; axis < n_axis; axis++) {
             if (bitnum_is_true(axisMask, axis)) {
                 retval += Machine::Axes::_names[axis];
@@ -452,20 +477,22 @@ namespace Machine {
         }
 
         if (!config->_kinematics->canHome(axisMask)) {
-            sys.state = State::Alarm;
+            set_state(State::Alarm);
             return;
         }
 
         // Find any cycles that set the m_pos without motion
-        auto n_axis = config->_axes->_numberAxis;
+        auto n_axis = Axes::_numberAxis;
         for (int axis = X_AXIS; axis < n_axis; axis++) {
-            if (config->_axes->_axis[axis]->_homing->_cycle == set_mpos_only) {
+            auto homing = Axes::_axis[axis]->_homing;
+            if (homing && homing->_cycle == set_mpos_only) {
                 if (axisMask == 0 || axisMask & 1 << axis) {
                     float* mpos = get_mpos();
-                    mpos[axis]  = config->_axes->_axis[axis]->_homing->_mpos;
+                    mpos[axis]  = homing->_mpos;
                     set_motor_steps_from_mpos(mpos);
-                    if (axisMask == bitnum_to_mask(axis))
+                    if (axisMask == bitnum_to_mask(axis)) {
                         return;
+                    }
 
                     clear_bitnum(axisMask, axis);
                 }
@@ -494,20 +521,20 @@ namespace Machine {
 
         if (_remainingCycles.empty()) {
             log_error("No homing cycles defined");
-            sys.state = State::Alarm;
+            set_state(State::Alarm);
             return;
         }
-        config->_stepping->beginLowLatency();
+        Stepping::beginLowLatency();
 
-        sys.state = State::Homing;
+        set_state(State::Homing);
         nextCycle();
     }
 
     AxisMask Homing::axis_mask_from_cycle(int cycle) {
         AxisMask axisMask = 0;
-        auto     n_axis   = config->_axes->_numberAxis;
+        auto     n_axis   = Axes::_numberAxis;
         for (int axis = 0; axis < n_axis; axis++) {
-            auto axisConfig = config->_axes->_axis[axis];
+            auto axisConfig = Axes::_axis[axis];
             auto homing     = axisConfig->_homing;
             if (homing && homing->_cycle == cycle) {
                 set_bitnum(axisMask, axis);

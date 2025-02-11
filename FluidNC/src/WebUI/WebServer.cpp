@@ -1,50 +1,43 @@
 // Copyright (c) 2014 Luc Lebosse. All rights reserved.
 // Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
 
-#include "../Machine/MachineConfig.h"
-#include "../Config.h"
-#include "../Serial.h"    // is_realtime_command()
-#include "../Settings.h"  // settings_execute_line()
+#include "src/Machine/MachineConfig.h"
+#include "src/Serial.h"    // is_realtime_command()
+#include "src/Settings.h"  // settings_execute_line()
 
-#ifdef ENABLE_WIFI
+#include "WebServer.h"
 
-#    include "WifiServices.h"
-#    include "WifiConfig.h"  // wifi_config
+#include "Mdns.h"
 
-#    include "WebServer.h"
+#include <WebSocketsServer.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <StreamString.h>
+#include <Update.h>
+#include <esp_wifi_types.h>
+// #include <ESP32SSDP.h>
+#include <DNSServer.h>
 
-#    include <WebSocketsServer.h>
-#    include <WiFi.h>
-#    include <WebServer.h>
-#    include <ESP32SSDP.h>
-#    include <StreamString.h>
-#    include <Update.h>
-#    include <esp_wifi_types.h>
-#    include <ESPmDNS.h>
-#    include <ESP32SSDP.h>
-#    include <DNSServer.h>
-#    include "WebSettings.h"
+#include "WSChannel.h"
 
-#    include "WSChannel.h"
+#include "WebClient.h"
 
-#    include "WebClient.h"
+#include "src/Protocol.h"  // protocol_send_event
+#include "src/FluidPath.h"
+#include "src/JSONEncoder.h"
 
-#    include "src/Protocol.h"  // protocol_send_event
-#    include "src/FluidPath.h"
-#    include "src/WebUI/JSONEncoder.h"
-
-#    include "src/HashFS.h"
-#    include <list>
+#include "src/HashFS.h"
+#include <list>
 
 namespace WebUI {
     const byte DNS_PORT = 53;
     DNSServer  dnsServer;
 }
 
-#    include <esp_ota_ops.h>
+#include <esp_ota_ops.h>
 
 //embedded response file if no files on LocalFS
-#    include "NoFile.h"
+#include "NoFile.h"
 
 namespace WebUI {
     // Error codes for upload
@@ -58,25 +51,28 @@ namespace WebUI {
 
     static const char LOCATION_HEADER[] = "Location";
 
-    Web_Server webServer __attribute__((init_priority(108)));
-    bool       Web_Server::_setupdone = false;
-    uint16_t   Web_Server::_port      = 0;
+    bool     Web_Server::_setupdone = false;
+    uint16_t Web_Server::_port      = 0;
 
     UploadStatus      Web_Server::_upload_status   = UploadStatus::NONE;
     WebServer*        Web_Server::_webserver       = NULL;
     WebSocketsServer* Web_Server::_socket_server   = NULL;
     WebSocketsServer* Web_Server::_socket_serverv3 = NULL;
-#    ifdef ENABLE_AUTHENTICATION
+#ifdef ENABLE_AUTHENTICATION
     AuthenticationIP* Web_Server::_head  = NULL;
     uint8_t           Web_Server::_nb_ip = 0;
     const int         MAX_AUTH_IP        = 10;
-#    endif
+#endif
     FileStream* Web_Server::_uploadFile = nullptr;
 
     EnumSetting *http_enable, *http_block_during_motion;
     IntSetting*  http_port;
 
-    Web_Server::Web_Server() {
+    Web_Server::~Web_Server() {
+        deinit();
+    }
+
+    void Web_Server::init() {
         http_port   = new IntSetting("HTTP Port", WEBSET, WA, "ESP121", "HTTP/Port", DEFAULT_HTTP_PORT, MIN_HTTP_PORT, MAX_HTTP_PORT);
         http_enable = new EnumSetting("HTTP Enable", WEBSET, WA, "ESP120", "HTTP/Enable", DEFAULT_HTTP_STATE, &onoffOptions);
         http_block_during_motion = new EnumSetting("Block serving HTTP content during motion",
@@ -86,27 +82,24 @@ namespace WebUI {
                                                    "HTTP/BlockDuringMotion",
                                                    DEFAULT_HTTP_BLOCKED_DURING_MOTION,
                                                    &onoffOptions);
-    }
-    Web_Server::~Web_Server() { end(); }
 
-    bool Web_Server::begin() {
-        bool no_error = true;
-        _setupdone    = false;
+        _setupdone = false;
 
-        if (!WebUI::http_enable->get()) {
-            return false;
+        if (WiFi.getMode() == WIFI_OFF || !http_enable->get()) {
+            return;
         }
-        _port = WebUI::http_port->get();
+
+        _port = http_port->get();
 
         //create instance
         _webserver = new WebServer(_port);
-#    ifdef ENABLE_AUTHENTICATION
+#ifdef ENABLE_AUTHENTICATION
         //here the list of headers to be recorded
         const char* headerkeys[]   = { "Cookie" };
         size_t      headerkeyssize = sizeof(headerkeys) / sizeof(char*);
         //ask server to track these headers
         _webserver->collectHeaders(headerkeys, headerkeyssize);
-#    endif
+#endif
 
         //here the list of headers to be recorded
         const char* headerkeys[]   = { "If-None-Match" };
@@ -140,6 +133,9 @@ namespace WebUI {
         _webserver->on("/command", HTTP_ANY, handle_web_command);
         _webserver->on("/command_silent", HTTP_ANY, handle_web_command_silent);
         _webserver->on("/feedhold_reload", HTTP_ANY, handleFeedholdReload);
+        _webserver->on("/cyclestart_reload", HTTP_ANY, handleCyclestartReload);
+        _webserver->on("/restart_reload", HTTP_ANY, handleRestartReload);
+        _webserver->on("/did_restart", HTTP_ANY, handleDidRestart);
 
         //LocalFS
         _webserver->on("/files", HTTP_ANY, handleFileList, LocalFSFileupload);
@@ -162,13 +158,14 @@ namespace WebUI {
             _webserver->on("/fwlink/", HTTP_ANY, handle_root);
         }
 
+#if 0
         //SSDP service presentation
-        if (WiFi.getMode() == WIFI_STA && WebUI::wifi_sta_ssdp->get()) {
+        if (WiFi.getMode() == WIFI_STA && WebUI::mdns_enable->get()) {
             _webserver->on("/description.xml", HTTP_GET, handle_SSDP);
             //Add specific for SSDP
             SSDP.setSchemaURL("description.xml");
             SSDP.setHTTPPort(_port);
-            SSDP.setName(wifi_config.Hostname().c_str());
+            SSDP.setName(WiFi.getHostname());
             SSDP.setURL("/");
             SSDP.setDeviceType("upnp:rootdevice");
             /*Any customization could be here
@@ -183,29 +180,25 @@ namespace WebUI {
             log_info("SSDP Started");
             SSDP.begin();
         }
+#endif
 
         log_info("HTTP started on port " << WebUI::http_port->get());
         //start webserver
         _webserver->begin();
 
-        //add mDNS
-        if (WiFi.getMode() == WIFI_STA && WebUI::wifi_sta_ssdp->get()) {
-            MDNS.addService("http", "tcp", _port);
-        }
+        Mdns::add("_http", "_tcp", _port);
 
         HashFS::hash_all();
 
         _setupdone = true;
-        return no_error;
     }
 
-    void Web_Server::end() {
+    void Web_Server::deinit() {
         _setupdone = false;
 
-        SSDP.end();
+        //        SSDP.end();
 
-        //remove mDNS
-        mdns_service_remove("_http", "_tcp");
+        Mdns::remove("_http", "_tcp");
 
         if (_socket_server) {
             delete _socket_server;
@@ -222,14 +215,14 @@ namespace WebUI {
             _webserver = NULL;
         }
 
-#    ifdef ENABLE_AUTHENTICATION
+#ifdef ENABLE_AUTHENTICATION
         while (_head) {
             AuthenticationIP* current = _head;
             _head                     = _head->_next;
             delete current;
         }
         _nb_ip = 0;
-#    endif
+#endif
     }
 
     // Send a file, either the specified path or path.gz
@@ -241,20 +234,7 @@ namespace WebUI {
         }
 
         std::string hash;
-        // Check for brower cache match
 
-        hash = HashFS::hash(fpath);
-        if (!hash.length()) {
-            std::filesystem::path gzpath(fpath);
-            gzpath += ".gz";
-            hash = HashFS::hash(gzpath);
-        }
-
-        if (hash.length() && std::string(_webserver->header("If-None-Match").c_str()) == hash) {
-            log_debug(path << " is cached");
-            _webserver->send(304);
-            return true;
-        }
         // If you load or reload WebUI while a program is running, there is a high
         // risk of stalling the motion because serving a file from
         // the local FLASH filesystem takes away a lot of CPU cycles.  If we get
@@ -263,7 +243,33 @@ namespace WebUI {
         // This can make it hard to debug ISR IRAM problems, because the easiest
         // way to trigger such problems is to refresh WebUI during motion.
         if (http_block_during_motion->get() && inMotionState()) {
+            // Check to see if we have a cached hash of the file that can be retrieved without accessing FLASH
+            hash = HashFS::hash(fpath, true);
+            if (!hash.length()) {
+                std::filesystem::path gzpath(fpath);
+                gzpath += ".gz";
+                hash = HashFS::hash(gzpath, true);
+            }
+
+            if (hash.length() && std::string(_webserver->header("If-None-Match").c_str()) == hash) {
+                _webserver->send(304);
+                return true;
+            }
+
             Web_Server::handleReloadBlocked();
+            return true;
+        }
+
+        // Check for brower cache match
+        hash = HashFS::hash(fpath);
+        if (!hash.length()) {
+            std::filesystem::path gzpath(fpath);
+            gzpath += ".gz";
+            hash = HashFS::hash(gzpath);
+        }
+
+        if (hash.length() && std::string(_webserver->header("If-None-Match").c_str()) == hash) {
+            _webserver->send(304);
             return true;
         }
 
@@ -325,7 +331,9 @@ namespace WebUI {
         "interval=setInterval(function(){\ni=i+1; \nvar x = document.getElementById(\"prg\"); \nx.value=i; \nif (i>5) "
         "\n{\nclearInterval(interval);\nwindow.location.href='/';\n}\n},1000);\n</script>\n</CENTER>\n</BODY>\n</HTML>\n\n";
 
-    void Web_Server::sendCaptivePortal() { sendWithOurAddress(PAGE_CAPTIVE, 200); }
+    void Web_Server::sendCaptivePortal() {
+        sendWithOurAddress(PAGE_CAPTIVE, 200);
+    }
 
     //Default 404 page that is sent when a request cannot be satisfied
     const char PAGE_404[] =
@@ -335,7 +343,9 @@ namespace WebUI {
         "interval=setInterval(function(){\ni=i+1; \nvar x = document.getElementById(\"prg\"); \nx.value=i; \nif (i>5) "
         "\n{\nclearInterval(interval);\nwindow.location.href='/';\n}\n},1000);\n</script>\n</CENTER>\n</BODY>\n</HTML>\n\n";
 
-    void Web_Server::send404Page() { sendWithOurAddress(PAGE_404, 404); }
+    void Web_Server::send404Page() {
+        sendWithOurAddress(PAGE_404, 404);
+    }
 
     void Web_Server::handle_root() {
         log_info("WebUI: Request from " << _webserver->client().remoteIP());
@@ -386,6 +396,7 @@ namespace WebUI {
         send404Page();
     }
 
+#if 0
     //http SSDP xml presentation
     void Web_Server::handle_SSDP() {
         StreamString sschema;
@@ -393,39 +404,39 @@ namespace WebUI {
             _webserver->send(500);
             return;
         }
-        const char* templ = "<?xml version=\"1.0\"?>"
-                            "<root xmlns=\"urn:schemas-upnp-org:device-1-0\">"
-                            "<specVersion>"
-                            "<major>1</major>"
-                            "<minor>0</minor>"
-                            "</specVersion>"
-                            "<URLBase>http://%s:%u/</URLBase>"
-                            "<device>"
-                            "<deviceType>upnp:rootdevice</deviceType>"
-                            "<friendlyName>%s</friendlyName>"
-                            "<presentationURL>/</presentationURL>"
-                            "<serialNumber>%s</serialNumber>"
-                            "<modelName>ESP32</modelName>"
-                            "<modelNumber>Marlin</modelNumber>"
-                            "<modelURL>http://espressif.com/en/products/hardware/esp-wroom-32/overview</modelURL>"
-                            "<manufacturer>Espressif Systems</manufacturer>"
-                            "<manufacturerURL>http://espressif.com</manufacturerURL>"
-                            "<UDN>uuid:%s</UDN>"
-                            "</device>"
-                            "</root>\r\n"
-                            "\r\n";
-        char        uuid[37];
-        const char* sip    = IP_string(WiFi.localIP()).c_str();
-        uint32_t    chipId = (uint16_t)(ESP.getEfuseMac() >> 32);
+        const char*       templ = "<?xml version=\"1.0\"?>"
+                                  "<root xmlns=\"urn:schemas-upnp-org:device-1-0\">"
+                                  "<specVersion>"
+                                  "<major>1</major>"
+                                  "<minor>0</minor>"
+                                  "</specVersion>"
+                                  "<URLBase>http://%s:%u/</URLBase>"
+                                  "<device>"
+                                  "<deviceType>upnp:rootdevice</deviceType>"
+                                  "<friendlyName>%s</friendlyName>"
+                                  "<presentationURL>/</presentationURL>"
+                                  "<serialNumber>%u</serialNumber>"
+                                  "<modelName>ESP32</modelName>"
+                                  "<modelNumber>Marlin</modelNumber>"
+                                  "<modelURL>http://espressif.com/en/products/hardware/esp-wroom-32/overview</modelURL>"
+                                  "<manufacturer>Espressif Systems</manufacturer>"
+                                  "<manufacturerURL>http://espressif.com</manufacturerURL>"
+                                  "<UDN>uuid:%s</UDN>"
+                                  "</device>"
+                                  "</root>\r\n"
+                                  "\r\n";
+        char              uuid[37];
+        const std::string sip    = IP_string(WiFi.localIP());
+        uint32_t          chipId = (uint16_t)(ESP.getEfuseMac() >> 32);
         sprintf(uuid,
                 "38323636-4558-4dda-9188-cda0e6%02x%02x%02x",
                 (uint16_t)((chipId >> 16) & 0xff),
                 (uint16_t)((chipId >> 8) & 0xff),
                 (uint16_t)chipId & 0xff);
-        const char* serialNumber = std::to_string(chipId).c_str();
-        sschema.printf(templ, sip, _port, wifi_config.Hostname().c_str(), serialNumber, uuid);
+        sschema.printf(templ, sip.c_str(), _port, WiFi.getHostname(), chipId, uuid);
         _webserver->send(200, "text/xml", sschema);
     }
+#endif
 
     // WebUI sends a PAGEID arg to identify the websocket it is using
     int Web_Server::getPageid() {
@@ -435,6 +446,10 @@ namespace WebUI {
         return -1;
     }
     void Web_Server::synchronousCommand(const char* cmd, bool silent, AuthenticationLevel auth_level) {
+        if (http_block_during_motion->get() && inMotionState()) {
+            _webserver->send(503, "text/plain", "Try again when not moving\n");
+            return;
+        }
         char line[256];
         strncpy(line, cmd, 255);
         webClient.attachWS(_webserver, silent);
@@ -470,7 +485,7 @@ namespace WebUI {
 
             auto cmd = _webserver->arg("cmd");
             // [ESPXXX] commands expect data in the HTTP response
-            if (cmd.startsWith("[ESP")) {
+            if (cmd.startsWith("[ESP") || cmd.startsWith("$/")) {
                 synchronousCommand(cmd.c_str(), silent, auth_level);
             } else {
                 websocketCommand(cmd.c_str(), -1, auth_level);  // WebUI3 does not support PAGEID
@@ -482,7 +497,14 @@ namespace WebUI {
             return;
         }
         if (_webserver->hasArg("commandText")) {
-            websocketCommand(_webserver->arg("commandText").c_str(), getPageid(), auth_level);
+            auto cmd = _webserver->arg("commandText");
+            if (cmd.startsWith("[ESP")) {
+                // [ESPXXX] commands expect data in the HTTP response
+                // Only the fallback web page uses commandText with [ESPxxx]
+                synchronousCommand(cmd.c_str(), silent, auth_level);
+            } else {
+                websocketCommand(_webserver->arg("commandText").c_str(), getPageid(), auth_level);
+            }
             return;
         }
         _webserver->send(500, "text/plain", "Invalid command");
@@ -490,7 +512,7 @@ namespace WebUI {
 
     //login status check
     void Web_Server::handle_login() {
-#    ifdef ENABLE_AUTHENTICATION
+#ifdef ENABLE_AUTHENTICATION
         const char* smsg;
         std::string sUser, sPassword;
         const char* auths;
@@ -637,30 +659,64 @@ namespace WebUI {
             }
             sendAuth(smsg, auths, "");
         }
-#    else
+#else
         sendAuth("Ok", "admin", "");
-#    endif
+#endif
     }
 
     // This page is used when you try to reload WebUI during motion,
     // to avoid interrupting that motion.  It lets you wait until
-    // motion is finished or issue a feedhold.
+    // motion is finished.
     void Web_Server::handleReloadBlocked() {
         _webserver->send(503,
                          "text/html",
                          "<!DOCTYPE html><html><body>"
-                         "<h3>Cannot load WebUI while moving</h3>"
-                         "<button onclick='window.location.reload()'>Retry</button>"
-                         "&nbsp;Retry (you must first wait for motion to finish)<br><br>"
-                         "<button onclick='window.location.replace(\"/feedhold_reload\")'>Feedhold</button>"
-                         "&nbsp;Stop the motion with feedhold and then retry<br>"
+                         "<h3>Cannot load WebUI while GCode Program is Running</h3>"
+
+                         "<button onclick='window.location.replace(\"/feedhold_reload\")'>Pause</button>"
+                         "&nbsp;Pause the GCode program with feedhold<br><br>"
+
+                         "<button onclick='window.location.replace(\"/restart_reload\")'>Stop</button>"
+                         "&nbsp;Stop the GCode Program with reset<br><br>"
+
+                         "<button onclick='window.location.reload()'>Reload WebUI</button>"
+                         "&nbsp;(You must first stop the GCode program or wait for it to finish)<br><br>"
+
+                         "</body></html>");
+    }
+    void Web_Server::handleDidRestart() {
+        _webserver->send(503,
+                         "text/html",
+                         "<!DOCTYPE html><html><body>"
+                         "<h3>GCode Program has been stopped</h3>"
+                         "<button onclick='window.location.replace(\"/\")'>Reload WebUI</button>"
                          "</body></html>");
     }
     // This page issues a feedhold to pause the motion then retries the WebUI reload
     void Web_Server::handleFeedholdReload() {
         protocol_send_event(&feedHoldEvent);
+        //        delay(100);
+        //        delay(100);
         // Go to the main page
         _webserver->sendHeader(LOCATION_HEADER, "/");
+        _webserver->send(302);
+    }
+    // This page issues a feedhold to pause the motion then retries the WebUI reload
+    void Web_Server::handleCyclestartReload() {
+        protocol_send_event(&cycleStartEvent);
+        //        delay(100);
+        //        delay(100);
+        // Go to the main page
+        _webserver->sendHeader(LOCATION_HEADER, "/");
+        _webserver->send(302);
+    }
+    // This page issues a feedhold to pause the motion then retries the WebUI reload
+    void Web_Server::handleRestartReload() {
+        protocol_send_event(&rtResetEvent);
+        //        delay(100);
+        //        delay(100);
+        // Go to the main page
+        _webserver->sendHeader(LOCATION_HEADER, "/did_restart");
         _webserver->send(302);
     }
 
@@ -680,14 +736,14 @@ namespace WebUI {
             uint32_t start_time = millis();
             while ((millis() - start_time) < timeout) {
                 _socket_server->loop();
-                delay(10);
+                delay_ms(10);
             }
 
             if (_socket_serverv3) {
                 start_time = millis();
                 while ((millis() - start_time) < timeout) {
                     _socket_serverv3->loop();
-                    delay(10);
+                    delay_ms(10);
                 }
             }
         }
@@ -765,10 +821,16 @@ namespace WebUI {
         sendJSON(code, s);
     }
 
-    void Web_Server::sendAuthFailed() { sendStatus(401, "Authentication failed"); }
+    void Web_Server::sendAuthFailed() {
+        sendStatus(401, "Authentication failed");
+    }
 
-    void Web_Server::LocalFSFileupload() { fileUpload(localfsName); }
-    void Web_Server::SDFileUpload() { fileUpload(sdName); }
+    void Web_Server::LocalFSFileupload() {
+        fileUpload(localfsName);
+    }
+    void Web_Server::SDFileUpload() {
+        fileUpload(sdName);
+    }
 
     //Web Update handler
     void Web_Server::handleUpdate() {
@@ -784,7 +846,7 @@ namespace WebUI {
         //if success restart
         if (_upload_status == UploadStatus::SUCCESSFUL) {
             delay_ms(1000);
-            COMMANDS::restart_MCU();
+            protocol_send_event(&fullResetEvent);
         } else {
             _upload_status = UploadStatus::NONE;
         }
@@ -841,7 +903,7 @@ namespace WebUI {
                     //Upload write
                     //**************
                 } else if (upload.status == UPLOAD_FILE_WRITE) {
-                    vTaskDelay(1 / portTICK_RATE_MS);
+                    delay_ms(1);
                     //check if no error
                     if (_upload_status == UploadStatus::ONGOING) {
                         if (((100 * upload.totalSize) / maxSketchSpace) != last_upload_update) {
@@ -978,8 +1040,8 @@ namespace WebUI {
             list_files = false;
         }
 
-        std::string        s;
-        WebUI::JSONencoder j(&s);
+        std::string s;
+        JSONencoder j(&s);
         j.begin();
 
         if (list_files) {
@@ -1014,8 +1076,12 @@ namespace WebUI {
         sendJSON(200, s);
     }
 
-    void Web_Server::handle_direct_SDFileList() { handleFileOps(sdName); }
-    void Web_Server::handleFileList() { handleFileOps(localfsName); }
+    void Web_Server::handle_direct_SDFileList() {
+        handleFileOps(sdName);
+    }
+    void Web_Server::handleFileList() {
+        handleFileOps(localfsName);
+    }
 
     // File upload
     void Web_Server::uploadStart(const char* filename, size_t filesize, const char* fs) {
@@ -1057,7 +1123,7 @@ namespace WebUI {
     }
 
     void Web_Server::uploadWrite(uint8_t* buffer, size_t length) {
-        vTaskDelay(1 / portTICK_RATE_MS);
+        delay_ms(1);
         if (_uploadFile && _upload_status == UploadStatus::ONGOING) {
             //no error write post data
             if (length != _uploadFile->write(buffer, length)) {
@@ -1136,7 +1202,7 @@ namespace WebUI {
         }
     }
 
-    void Web_Server::handle() {
+    void Web_Server::poll() {
         static uint32_t start_time = millis();
         if (WiFi.getMode() == WIFI_AP) {
             dnsServer.processNextRequest();
@@ -1201,7 +1267,7 @@ namespace WebUI {
 
     //check authentification
     AuthenticationLevel Web_Server::is_authenticated() {
-#    ifdef ENABLE_AUTHENTICATION
+#ifdef ENABLE_AUTHENTICATION
         if (_webserver->hasHeader("Cookie")) {
             std::string cookie(_webserver->header("Cookie").c_str());
             size_t      pos = cookie.find("ESPSESSIONID=");
@@ -1214,12 +1280,12 @@ namespace WebUI {
             }
         }
         return AuthenticationLevel::LEVEL_GUEST;
-#    else
+#else
         return AuthenticationLevel::LEVEL_ADMIN;
-#    endif
+#endif
     }
 
-#    ifdef ENABLE_AUTHENTICATION
+#ifdef ENABLE_AUTHENTICATION
 
     //add the information in the linked list if possible
     bool Web_Server::AddAuthIP(AuthenticationIP* item) {
@@ -1333,6 +1399,6 @@ namespace WebUI {
         }
         return AuthenticationLevel::LEVEL_GUEST;
     }
-#    endif
-}
 #endif
+    ModuleFactory::InstanceBuilder<Web_Server> __attribute__((init_priority(108))) web_server_module("wifi", true);
+}

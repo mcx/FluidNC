@@ -21,7 +21,7 @@ namespace MotorDrivers {
 
         void set_location();
 
-        uint8_t _id;
+        uint8_t _id = 255;
 
         static int _timer_ms;
 
@@ -99,22 +99,19 @@ namespace MotorDrivers {
         uint32_t _countMin = 1024;
         uint32_t _countMax = 3072;
 
-        bool        _disabled;
+        bool        _disabled = true;
         static bool _has_errors;
 
     public:
-        Dynamixel2() : _id(255), _disabled(true) {}
+        Dynamixel2(const char* name) : Servo(name) {}
 
         // Overrides for inherited methods
         void        init() override;
-        void        read_settings() override;
         bool        set_homing_mode(bool isHoming) override;
         void        set_disable(bool disable) override;
         void        update() override;
         static void update_all();
         void        config_motor() override;
-
-        const char* name() override { return "dynamixel2"; }
 
         // Configuration handlers:
         void validate() override {
@@ -131,8 +128,5 @@ namespace MotorDrivers {
 
             Servo::group(handler);
         }
-
-        // Name of the configurable. Must match the name registered in the cpp file.
-        const char* name() const override { return "dynamixel2"; }
     };
 }

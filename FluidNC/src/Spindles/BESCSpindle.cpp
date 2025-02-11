@@ -26,7 +26,7 @@
 namespace Spindles {
     void BESC::init() {
         if (_output_pin.undefined()) {
-            log_warn("BESC output pin not defined");
+            log_config_error(name() << " spindle output pin not defined");
             return;  // We cannot continue without the output pin
         }
 
@@ -54,8 +54,9 @@ namespace Spindles {
 
         // Use yaml speed_map to setup speed map for "spindle speed" conversion to timer counts used by PWM controller
         //setupSpeeds(_pulse_span_counts); // Map the counts for just the part of the pulse that changes to keep math inside 32bits later...
-        setupSpeeds(_pwm->period());       // Map the entire pulse width period in counts
+        setupSpeeds(_pwm->period());  // Map the entire pulse width period in counts
         stop();
+        init_atc();
         config_message();
     }
 
@@ -76,17 +77,16 @@ namespace Spindles {
         // represents full on.  Typically the off value is a 1ms pulse length and the
         // full on value is a 2ms pulse.
         // uint32_t pulse_counts = _min_pulse_counts + (_pulse_span_counts * (uint64_t) duty)/_pwm->period();
-        _pwm->setDuty(_min_pulse_counts + (_pulse_span_counts * (uint64_t) duty)/_pwm->period());
+        _pwm->setDuty(_min_pulse_counts + (_pulse_span_counts * (uint64_t)duty) / _pwm->period());
         // _pwm->setDuty(_min_pulse_counts+duty); // More efficient by keeping math within 32bits??
         // log_info(name() << " duty:" << duty << " _min_pulse_counts:" << _min_pulse_counts
         //                 << " _pulse_span_counts:" << _pulse_span_counts << " pulse_counts" << pulse_counts);
-
     }
 
     // prints the startup message of the spindle config
     void BESC::config_message() {
         log_info(name() << " Spindle Out:" << _output_pin.name() << " Min:" << _min_pulse_us << "us Max:" << _max_pulse_us
-                        << "us Freq:" << _pwm->frequency() << "Hz Full Period count:" << _pwm->period());
+                        << "us Freq:" << _pwm->frequency() << "Hz Full Period count:" << _pwm->period() << atc_info());
     }
 
     // Configuration registration

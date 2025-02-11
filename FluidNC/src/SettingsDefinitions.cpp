@@ -1,6 +1,8 @@
 #include "Machine/MachineConfig.h"
 #include "SettingsDefinitions.h"
 #include "Config.h"
+#include "Stepping.h"
+#include "Machine/Homing.h"
 
 #include <tuple>
 #include <array>
@@ -21,7 +23,7 @@ EnumSetting* message_level;
 std::vector<std::unique_ptr<MachineConfigProxySetting<float>>>   float_proxies;
 std::vector<std::unique_ptr<MachineConfigProxySetting<int32_t>>> int_proxies;
 
-enum_opt_t messageLevels = {
+const enum_opt_t messageLevels = {
     // clang-format off
     { "None", MsgLevelNone },
     { "Error", MsgLevelError },
@@ -32,7 +34,9 @@ enum_opt_t messageLevels = {
     // clang-format on
 };
 
-enum_opt_t onoffOptions = { { "OFF", 0 }, { "ON", 1 } };
+const enum_opt_t onoffOptions = { { "OFF", 0 }, { "ON", 1 } };
+
+EnumSetting* gcode_echo;
 
 void make_coordinate(CoordIndex index, const char* name) {
     float coord_data[MAX_N_AXIS] = { 0.0 };
@@ -78,7 +82,10 @@ void make_settings() {
 
     build_info = new StringSetting("OEM build info for $I command", EXTENDED, WG, NULL, "Firmware/Build", "", 0, 20);
 
-    start_message = new StringSetting("Message issued at startup", EXTENDED, WG, NULL, "Start/Message", "Grbl \\V [FluidNC \\B (\\R) \\H]", 0, 40);
+    start_message =
+        new StringSetting("Message issued at startup", EXTENDED, WG, NULL, "Start/Message", "Grbl \\V [FluidNC \\B (\\R) \\H]", 0, 40);
+
+    gcode_echo = new EnumSetting("GCode Echo Enable", WEBSET, WG, NULL, "GCode/Echo", 0, &onoffOptions);
 
     // Some gcode senders expect Grbl to report certain numbered settings to improve
     // their reporting. The following macros set up various legacy numbered Grbl settings,
@@ -104,7 +111,10 @@ void make_settings() {
     FLOAT_PROXY("101", "Grbl/Resolution/Y", config._axes->_axis[1]->_stepsPerMm)
     FLOAT_PROXY("102", "Grbl/Resolution/Z", config._axes->_axis[2]->_stepsPerMm)
 
+    INT_PROXY("3", "Grbl/InvertMask", Machine::Stepping::direction_mask)
     INT_PROXY("20", "Grbl/SoftLimitsEnable", config._axes->_axis[0]->_softLimits)
     INT_PROXY("21", "Grbl/HardLimitsEnable", config._axes->hasHardLimits())
     INT_PROXY("22", "Grbl/HomingCycleEnable", (bool)Axes::homingMask)
+    INT_PROXY("23", "Grbl/HomingInvertMask", Homing::direction_mask)
+    INT_PROXY("32", "Grbl/LaserMode", spindle->isRateAdjusted())
 }

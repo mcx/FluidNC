@@ -65,7 +65,7 @@ class Pin {
 
     static const char* parse(std::string_view str, Pins::PinDetail*& detail);
 
-    inline Pin(Pins::PinDetail* detail) : _detail(detail) {}
+    explicit inline Pin(Pins::PinDetail* detail) : _detail(detail) {}
 
 public:
     using Capabilities = Pins::PinCapabilities;
@@ -95,7 +95,7 @@ public:
     inline Pin(Pin&& o) : _detail(nullptr) { std::swap(_detail, o._detail); }
 
     inline Pin& operator=(const Pin& o) = delete;
-    inline Pin& operator                =(Pin&& o) {
+    inline Pin& operator=(Pin&& o) {
         std::swap(_detail, o._detail);
         return *this;
     }
@@ -113,6 +113,9 @@ public:
         Assert(_detail->capabilities().has(expectedBehavior), "Requested pin %s does not have the expected behavior.", name().c_str());
         return _detail->_index;
     }
+    inline bool canStep() { return _detail->canStep(); }
+    inline int  index() { return _detail->_index; }
+    inline bool inverted() { return _detail->_inverted; }
 
     void write(bool value) const;
     void synchronousWrite(bool value) const;
@@ -136,7 +139,7 @@ public:
     inline std::string name() const { return _detail->toString(); }
 
     void report(const char* legend);
-    void report(std::string legend) { report(legend.c_str()); }
+    void report(const std::string& legend) { report(legend.c_str()); }
 
     inline void swap(Pin& o) { std::swap(o._detail, _detail); }
 

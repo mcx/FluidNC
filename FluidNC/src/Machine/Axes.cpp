@@ -8,7 +8,7 @@
 #include "MachineConfig.h"  // config->
 #include "../Limits.h"
 
-EnumItem axisType[] = { { 0, "X" }, { 1, "Y" }, { 2, "Z" }, { 3, "A" }, { 4, "B" }, { 5, "C" }, EnumItem(0) };
+const EnumItem axisType[] = { { 0, "X" }, { 1, "Y" }, { 2, "Z" }, { 3, "A" }, { 4, "B" }, { 5, "C" }, EnumItem(0) };
 
 namespace Machine {
     MotorMask Axes::posLimitMask = 0;
@@ -18,14 +18,21 @@ namespace Machine {
 
     AxisMask Axes::homingMask = 0;
 
-    Axes::Axes() : _axis() {
-        for (int i = 0; i < MAX_N_AXIS; ++i) {
-            _axis[i] = nullptr;
-        }
-    }
+    bool Axes::disabled = false;
+
+    Pin Axes::_sharedStepperDisable;
+    Pin Axes::_sharedStepperReset;
+
+    uint32_t Axes::_homing_runs = 2;  // Number of Approach/Pulloff cycles
+
+    int Axes::_numberAxis = 0;
+
+    Axis* Axes::_axis[MAX_N_AXIS] = { nullptr };
+
+    Axes::Axes() {}
 
     void Axes::init() {
-        log_info("Axis count " << config->_axes->_numberAxis);
+        log_info("Axis count " << Axes::_numberAxis);
 
         if (_sharedStepperDisable.defined()) {
             _sharedStepperDisable.setAttr(Pin::Attr::Output);
@@ -45,6 +52,10 @@ namespace Machine {
                 log_info("Axis " << axisName(axis) << " (" << limitsMinPosition(axis) << "," << limitsMaxPosition(axis) << ")");
                 a->init();
             }
+            auto homing = a->_homing;
+            if (homing && !homing->_positiveDirection) {
+                set_bitnum(Homing::direction_mask, axis);
+            }
         }
 
         config_motors();
@@ -57,6 +68,8 @@ namespace Machine {
                 m->_driver->set_disable(disable);
             }
         }
+        if (disable)  // any disable, !disable does not change anything here
+            disabled = true;
     }
 
     void IRAM_ATTR Axes::set_disable(bool disable) {
@@ -66,9 +79,11 @@ namespace Machine {
 
         _sharedStepperDisable.synchronousWrite(disable);
 
-        if (!disable && config->_stepping->_disableDelayUsecs) {  // wait for the enable delay
-            log_debug("enable delay:" << config->_stepping->_disableDelayUsecs);
-            delay_us(config->_stepping->_disableDelayUsecs);
+        if (!disable && disabled) {
+            disabled = false;
+            if (Stepping::_disableDelayUsecs) {  // wait for the enable delay
+                delay_us(Stepping::_disableDelayUsecs);
+            }
         }
     }
 
@@ -82,9 +97,9 @@ namespace Machine {
                 auto a = _axis[axis];
                 if (a != nullptr) {
                     for (size_t motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; motor++) {
+                        Stepping::unblock(axis, motor);
                         auto m = _axis[axis]->_motors[motor];
                         if (m) {
-                            m->unblock();
                             if (m->_driver->set_homing_mode(isHoming)) {
                                 set_bitnum(motorsCanHome, motor_bit(axis, motor));
                             }
@@ -97,62 +112,6 @@ namespace Machine {
         return motorsCanHome;
     }
 
-    void IRAM_ATTR Axes::step(uint8_t step_mask, uint8_t dir_mask) {
-        auto n_axis = _numberAxis;
-        //log_info("motors_set_direction_pins:0x%02X", onMask);
-
-        // Set the direction pins, but optimize for the common
-        // situation where the direction bits haven't changed.
-        static uint8_t previous_dir = 255;  // should never be this value
-        if (dir_mask != previous_dir) {
-            previous_dir = dir_mask;
-
-            for (int axis = X_AXIS; axis < n_axis; axis++) {
-                bool thisDir = bitnum_is_true(dir_mask, axis);
-
-                for (size_t motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; motor++) {
-                    auto m = _axis[axis]->_motors[motor];
-                    if (m) {
-                        m->_driver->set_direction(thisDir);
-                    }
-                }
-            }
-            config->_stepping->waitDirection();
-        }
-
-        // Turn on step pulses for motors that are supposed to step now
-        for (size_t axis = X_AXIS; axis < n_axis; axis++) {
-            if (bitnum_is_true(step_mask, axis)) {
-                bool dir = bitnum_is_true(dir_mask, axis);
-
-                auto a = _axis[axis];
-                for (size_t motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; motor++) {
-                    auto m = a->_motors[motor];
-                    if (m) {
-                        m->step(dir);
-                    }
-                }
-            }
-        }
-        config->_stepping->startPulseTimer();
-    }
-
-    // Turn all stepper pins off
-    void IRAM_ATTR Axes::unstep() {
-        config->_stepping->waitPulse();
-        auto n_axis = _numberAxis;
-        for (size_t axis = X_AXIS; axis < n_axis; axis++) {
-            for (size_t motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; motor++) {
-                auto m = _axis[axis]->_motors[motor];
-                if (m) {
-                    m->_driver->unstep();
-                }
-            }
-        }
-
-        config->_stepping->finishPulse();
-    }
-
     void Axes::config_motors() {
         for (int axis = 0; axis < _numberAxis; ++axis) {
             _axis[axis]->config_motors();
@@ -161,7 +120,7 @@ namespace Machine {
 
     // Some small helpers to find the axis index and axis motor index for a given motor. This
     // is helpful for some motors that need this info, as well as debug information.
-    size_t Axes::findAxisIndex(const MotorDrivers::MotorDriver* const driver) const {
+    size_t Axes::findAxisIndex(const MotorDrivers::MotorDriver* const driver) {
         for (int i = 0; i < _numberAxis; ++i) {
             for (int j = 0; j < Axis::MAX_MOTORS_PER_AXIS; ++j) {
                 if (_axis[i] != nullptr && _axis[i]->hasMotor(driver)) {
@@ -174,7 +133,7 @@ namespace Machine {
         return SIZE_MAX;
     }
 
-    size_t Axes::findAxisMotor(const MotorDrivers::MotorDriver* const driver) const {
+    size_t Axes::findAxisMotor(const MotorDrivers::MotorDriver* const driver) {
         for (int i = 0; i < _numberAxis; ++i) {
             if (_axis[i] != nullptr && _axis[i]->hasMotor(driver)) {
                 for (int j = 0; j < Axis::MAX_MOTORS_PER_AXIS; ++j) {
@@ -195,6 +154,7 @@ namespace Machine {
     void Axes::group(Configuration::HandlerBase& handler) {
         handler.item("shared_stepper_disable_pin", _sharedStepperDisable);
         handler.item("shared_stepper_reset_pin", _sharedStepperReset);
+        handler.item("homing_runs", _homing_runs, 1, 5);
 
         // Handle axis names xyzabc.  handler.section is inferred
         // from a template.
@@ -263,9 +223,25 @@ namespace Machine {
         return retval;
     }
 
+    MotorMask Axes::hardLimitMask() {
+        MotorMask mask = 0;
+        for (int axis = 0; axis < _numberAxis; ++axis) {
+            auto a = _axis[axis];
+
+            for (int motor = 0; motor < Axis::MAX_MOTORS_PER_AXIS; ++motor) {
+                auto m = a->_motors[motor];
+                if (m && m->_hardLimits) {
+                    set_bitnum(mask, axis);
+                }
+            }
+        }
+        return mask;
+    }
+
     bool Axes::namesToMask(const char* names, AxisMask& mask) {
-        bool retval = true;
-        for (int i = 0; i < strlen(names); i++) {
+        bool       retval   = true;
+        const auto lenNames = strlen(names);
+        for (int i = 0; i < lenNames; i++) {
             char  axisName = toupper(names[i]);
             char* pos      = index(_names, axisName);
             if (!pos) {

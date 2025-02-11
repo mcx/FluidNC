@@ -28,8 +28,6 @@ void UartChannel::init(Uart* uart) {
         log_info("uart_channel" << _uart_num << " created");
     }
     log_msg_to(*this, "RST");
-    // Give the extender a little time to process the command
-    //    delay(100);
 }
 
 size_t UartChannel::write(uint8_t c) {
@@ -92,7 +90,13 @@ bool UartChannel::lineComplete(char* line, char c) {
 }
 
 int UartChannel::read() {
-    return _uart->read();
+    int c = _uart->read();
+    if (c == 0x11) {
+        // 0x11 is XON.  If we receive that, it is a request to use software flow control
+        _uart->setSwFlowControl(true, -1, -1);
+        return -1;
+    }
+    return c;
 }
 
 void UartChannel::flushRx() {
@@ -122,16 +126,7 @@ void UartChannel::out(const std::string& s, const char* tag) {
 }
 
 void UartChannel::out_acked(const std::string& s, const char* tag) {
-    int count = 0;
-    while (_ackwait && ++count < _ack_timeout) {
-        pollLine(NULL);
-        delay_ms(1);
-    }
-    if (count == _ack_timeout) {
-        log_error("Device not responding");
-    }
-    out(s, tag);
-    _ackwait = true;
+    log_stream(*this, "[" << tag << s);
 }
 
 UartChannel Uart0(0, true);  // Primary serial channel with LF to CRLF conversion

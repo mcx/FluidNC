@@ -13,9 +13,13 @@
 #include "Protocol.h"             // protocol_buffer_synchronize
 #include "MotionControl.h"        // mc_override_ctrl_update
 #include "Machine/UserOutputs.h"  // setAnalogPercent
+#include "Machine/UserInputs.h"   // read digital/analog inputs
 #include "Platform.h"             // WEAK_LINK
+#include "Job.h"                  // Job::active() and Job::channel()
 
 #include "Machine/MachineConfig.h"
+#include "Parameters.h"
+#include "Flowcontrol.h"
 
 #include <string.h>  // memset
 #include <math.h>    // sqrt etc.
@@ -35,16 +39,41 @@ static const int32_t MaxLineNumber = 10000000;
 parser_state_t gc_state;
 parser_block_t gc_block;
 
+// clang-format off
+gc_modal_t modal_defaults = {
+    Motion::Seek,
+    FeedRate::UnitsPerMin,
+    Units::Mm,
+    Distance::Absolute,  // G90
+    // ArcDistance::Incremental
+    Plane::XY,
+    // CutterCompensation::Disable,
+    ToolLengthOffset::Cancel,
+    CoordIndex::G54,
+    ProgramFlow::Running,
+    {}, // 0, // CoolantState::M7,
+    SpindleState::Disable,
+    ToolChange::Disable,
+    SetToolNumber::Disable,
+    IoControl::None,
+    Override::ParkingMotion
+};
+// clang-format on
+
 #define FAIL(status) return (status);
 
 void gc_init() {
     // Reset parser state:
+    auto save_tlo = gc_state.tool_length_offset;  // we want TLO to persist until reboot.
     memset(&gc_state, 0, sizeof(parser_state_t));
+    gc_state.tool_length_offset = save_tlo;
 
     // Load default G54 coordinate system.
-    gc_state.modal.coord_select = CoordIndex::G54;
-    gc_state.modal.override     = config->_start->_deactivateParking ? Override::Disabled : Override::ParkingMotion;
+    gc_state.modal          = modal_defaults;
+    gc_state.modal.override = config->_start->_deactivateParking ? Override::Disabled : Override::ParkingMotion;
+    gc_state.current_tool   = -1;
     coords[gc_state.modal.coord_select]->get(gc_state.coord_system);
+    flowcontrol_init();
 }
 
 // Sets g-code parser position in mm. Input in steps. Called by the system abort and hard
@@ -53,19 +82,73 @@ void gc_sync_position() {
     motor_steps_to_mpos(gc_state.position, get_motor_steps());
 }
 
+static bool decode_format_string(const char* comment, size_t& index, size_t len, const char*& format) {
+    // comment[index] is '%'
+    const char* f   = comment + index;
+    int         rem = len - index;
+    if (rem > 1 && f[1] == 'd') {
+        ++index;
+        format = "%.0f";
+        return true;
+    }
+    if (rem > 2 && f[1] == 'f') {
+        ++index;
+        format = "%.4f";
+        return true;
+    }
+    if (rem > 3 && f[1] == '.' && f[2] >= '0' && f[2] <= '9' && f[3] == 'f') {
+        static char fmt[5];
+        memcpy(fmt, f, 4);
+        fmt[4] = '\0';
+        index += 3;
+        format = fmt;
+        return true;
+    }
+    return false;
+}
+
 static void gcode_comment_msg(char* comment) {
-    char         msg[80];
-    const size_t offset = 4;  // ignore "MSG_" part of comment
-    size_t       index  = offset;
+    char   msg[128];
+    size_t offset = strlen("MSG_");
+    size_t index;
     if (strstr(comment, "MSG")) {
-        while (index < strlen(comment)) {
-            msg[index - offset] = comment[index];
-            index++;
+        log_info("MSG," << &comment[offset]);
+        return;
+    }
+    offset       = strlen("PRINT,");  // Same length as DEBUG,
+    bool isdebug = strncasecmp(comment, "DEBUG,", offset) == 0;
+    if (isdebug || strncasecmp(comment, "PRINT,", offset) == 0) {
+        const char* format   = "%lf";
+        size_t      msgindex = 0;
+        size_t      len      = strlen(comment);
+        for (index = offset; index < len; ++index) {
+            char c = comment[index];
+            if (c == '%') {
+                if (!decode_format_string(comment, index, len, format)) {
+                    msg[msgindex++] = c;
+                }
+            } else if (c == '#') {
+                float number;
+                if (read_number(comment, index, number)) {
+                    msgindex += sprintf(&msg[msgindex], format, number);
+                } else {
+                    msg[msgindex++] = c;
+                }
+            } else {
+                msg[msgindex++] = c;
+            }
         }
-        msg[index - offset] = 0;  // null terminate
-        log_info("GCode Comment..." << msg);
+        msg[msgindex] = '\0';
+        if (isdebug) {
+            log_debug("DEBUG," << msg);
+        } else {
+            log_info("PRINT," << msg);
+        }
     }
 }
+
+static std::optional<WaitOnInputMode> validate_wait_on_input_mode_value(uint8_t);
+static Error                          gc_wait_on_input(bool is_digital, uint8_t input_number, WaitOnInputMode mode, float timeout);
 
 // Edit GCode line in-place, removing whitespace and comments and
 // converting to uppercase
@@ -91,21 +174,31 @@ void collapseGCode(char* line) {
                 // Strip out ) that does not follow a (
                 break;
             case '(':
+                if (gc_state.skip_blocks) {
+                    *line = '\0';
+                    return;
+                }
+
                 // Start the comment at the character after (
                 parenPtr = inPtr + 1;
                 break;
             case ';':
+                if (gc_state.skip_blocks) {
+                    *line = '\0';
+                    return;
+                }
                 // NOTE: ';' comment to EOL is a LinuxCNC definition. Not NIST.
                 // gcode_comment_msg(inPtr + 1);
                 *outPtr = '\0';
                 return;
             case '%':
-                // TODO: Install '%' feature
-                // Program start-end percent sign NOT SUPPORTED.
-                // NOTE: This may be installed to distinguish between program running vs manual input,
-                // where, during a program, the system auto-cycle start will continue to execute
-                // everything until the next '%' sign. This will help fix resuming issues with certain
-                // functions that empty the planner buffer to execute its task on-time.
+                // Per https://linuxcnc.org/docs/html/gcode/overview.html#gcode:file-requirements
+                // % only applies to "job" channels like files and macros, not to serial channels
+                // where the sequence of lines is potentially never-ending.  A sender that handles
+                // files on the host system could apply the % semantics.
+                if (Job::active()) {
+                    Job::channel()->percent();
+                }
                 break;
             case '\r':
                 // In case one sneaks in
@@ -124,11 +217,15 @@ void collapseGCode(char* line) {
     *outPtr = '\0';
 }
 
-static void gc_ngc_changed(CoordIndex coord) {
+void gc_ngc_changed(CoordIndex coord) {
     allChannels.notifyNgc(coord);
 }
 
-static void gc_wco_changed() {
+void gc_ovr_changed() {
+    allChannels.notifyOvr();
+}
+
+void gc_wco_changed() {
     if (FORCE_BUFFER_SYNC_DURING_WCO_CHANGE) {
         protocol_buffer_synchronize();
     }
@@ -163,18 +260,19 @@ Error gc_execute_line(char* line) {
     uint32_t command_words = 0;  // Tracks G and M command words. Also used for modal group violations.
     uint32_t value_words   = 0;  // Tracks value words.
 
-    bool jogMotion     = false;
-    bool checkMantissa = false;
-    bool clockwiseArc  = false;
-    bool probeExplicit = false;
-    bool probeAway     = false;
-    bool probeNoError  = false;
-    bool syncLaser     = false;
-    bool disableLaser  = false;
-    bool laserIsMotion = false;
-    bool nonmodalG38   = false;  // Used for G38.6-9
+    bool jogMotion            = false;
+    bool checkMantissa        = false;
+    bool clockwiseArc         = false;
+    bool probeExplicit        = false;
+    bool probeAway            = false;
+    bool probeNoError         = false;
+    bool syncLaser            = false;
+    bool disableLaser         = false;
+    bool laserIsMotion        = false;
+    bool nonmodalG38          = false;  // Used for G38.6-9
+    bool isWaitOnInputDigital = false;
 
-    auto    n_axis = config->_axes->_numberAxis;
+    auto    n_axis = Axes::_numberAxis;
     float   coord_data[MAX_N_AXIS];  // Used by WCO-related commands
     uint8_t pValue;                  // Integer value of P word
 
@@ -196,22 +294,41 @@ Error gc_execute_line(char* line) {
        words, and for negative values set for the value words F, N, P, T, and S. */
     ModalGroup mg_word_bit;  // Bit-value for assigning tracking variables
     uint32_t   bitmask = 0;
-    size_t     char_counter;
+    size_t     pos;
     char       letter;
     float      value;
-    uint8_t    int_value = 0;
-    uint16_t   mantissa  = 0;
-    char_counter         = jogMotion ? 3 : 0;  // Start parsing after `$J=` if jogging
-    while (line[char_counter] != 0) {          // Loop until no more g-code words in line.
+    int32_t    int_value = 0;
+    int32_t    mantissa  = 0;
+    pos                  = jogMotion ? 3 : 0;  // Start parsing after `$J=` if jogging
+    while ((letter = line[pos]) != '\0') {     // Loop until no more g-code words in line.
+        if (letter == '#') {
+            if (gc_state.skip_blocks) {
+                return Error::Ok;
+            }
+            pos++;
+            if (!assign_param(line, pos)) {
+                FAIL(Error::BadNumberFormat);
+            }
+            continue;
+        }
+
+        // XXX Should check that no other words are also present
+        if (bitnum_is_true(value_words, GCodeWord::O)) {
+            return flowcontrol(gc_block.values.o, line, pos, gc_state.skip_blocks);
+        }
+
         // Import the next g-code word, expecting a letter followed by a value. Otherwise, error out.
-        letter = line[char_counter];
         if ((letter < 'A') || (letter > 'Z')) {
             FAIL(Error::ExpectedCommandLetter);  // [Expected word letter]
         }
-        char_counter++;
-        if (!read_float(line, &char_counter, &value)) {
+        pos++;
+        if (!read_number(line, pos, value)) {
             FAIL(Error::BadNumberFormat);  // [Expected word value]
         }
+        if (gc_state.skip_blocks && letter != 'O') {
+            return Error::Ok;
+        }
+
         // Convert values to smaller uint8 significand and mantissa values for parsing this word.
         // NOTE: Mantissa is multiplied by 100 to catch non-integer command values. This is more
         // accurate than the NIST gcode requirement of x10 when used for commands, but not quite
@@ -219,7 +336,7 @@ Error gc_execute_line(char* line) {
         // a good enough compromise and catch most all non-integer errors. To make it compliant,
         // we would simply need to change the mantissa to int16, but this add compiled flash space.
         // Maybe update this later.
-        int_value = int8_t(truncf(value));
+        int_value = static_cast<int32_t>(truncf(value));
         mantissa  = lroundf(100 * (value - int_value));  // Compute mantissa for Gxx.x commands.
         // NOTE: Rounding must be used to catch small floating point errors.
         // Check if the g-code word is supported or errors due to modal group violations or has
@@ -530,8 +647,7 @@ Error gc_execute_line(char* line) {
                         break;
                     case 6:  // tool change
                         gc_block.modal.tool_change = ToolChange::Enable;
-                        // user_tool_change(gc_state.tool);
-                        mg_word_bit = ModalGroup::MM6;
+                        mg_word_bit                = ModalGroup::MM6;
                         break;
                     case 7:
                     case 8:
@@ -569,29 +685,37 @@ Error gc_execute_line(char* line) {
                             FAIL(Error::GcodeUnsupportedCommand);  // [Unsupported M command]
                         }
                         break;
+                    case 61:  // M61 set tool number
+                        gc_block.modal.set_tool_number = SetToolNumber::Enable;
+                        mg_word_bit                    = ModalGroup::MM6;
+                        break;
                     case 62:
                         gc_block.modal.io_control = IoControl::DigitalOnSync;
-                        mg_word_bit               = ModalGroup::MM10;
+                        mg_word_bit               = ModalGroup::MM5;
                         break;
                     case 63:
                         gc_block.modal.io_control = IoControl::DigitalOffSync;
-                        mg_word_bit               = ModalGroup::MM10;
+                        mg_word_bit               = ModalGroup::MM5;
                         break;
                     case 64:
                         gc_block.modal.io_control = IoControl::DigitalOnImmediate;
-                        mg_word_bit               = ModalGroup::MM10;
+                        mg_word_bit               = ModalGroup::MM5;
                         break;
                     case 65:
                         gc_block.modal.io_control = IoControl::DigitalOffImmediate;
-                        mg_word_bit               = ModalGroup::MM10;
+                        mg_word_bit               = ModalGroup::MM5;
+                        break;
+                    case 66:
+                        gc_block.modal.io_control = IoControl::WaitOnInput;
+                        mg_word_bit               = ModalGroup::MM5;
                         break;
                     case 67:
                         gc_block.modal.io_control = IoControl::SetAnalogSync;
-                        mg_word_bit               = ModalGroup::MM10;
+                        mg_word_bit               = ModalGroup::MM5;
                         break;
                     case 68:
                         gc_block.modal.io_control = IoControl::SetAnalogImmediate;
-                        mg_word_bit               = ModalGroup::MM10;
+                        mg_word_bit               = ModalGroup::MM5;
                         break;
                     default:
                         FAIL(Error::GcodeUnsupportedCommand);  // [Unsupported M command]
@@ -638,11 +762,14 @@ Error gc_execute_line(char* line) {
                             FAIL(Error::GcodeUnsupportedCommand);
                         }
                         break;
-                    // case 'D': // Not supported
+
+                    case 'D':  // Unsupported word used for parameter debugging
+                        axis_word_bit = GCodeWord::D;
+                        log_info("Value is " << value);
+                        break;
                     case 'E':
                         axis_word_bit     = GCodeWord::E;
                         gc_block.values.e = int_value;
-                        //log_info("E " << gc_block.values.e);
                         break;
                     case 'F':
                         axis_word_bit     = GCodeWord::F;
@@ -672,6 +799,13 @@ Error gc_execute_line(char* line) {
                         axis_word_bit     = GCodeWord::N;
                         gc_block.values.n = int32_t(truncf(value));
                         break;
+                    case 'O':
+                        if (mantissa > 0) {
+                            FAIL(Error::GcodeCommandValueNotInteger);
+                        }
+                        axis_word_bit     = GCodeWord::O;
+                        gc_block.values.o = int_value;
+                        break;
                     case 'P':
                         axis_word_bit     = GCodeWord::P;
                         gc_block.values.p = value;
@@ -694,8 +828,7 @@ Error gc_execute_line(char* line) {
                         if (value > MaxToolNumber) {
                             FAIL(Error::GcodeMaxValueExceeded);
                         }
-                        log_info("Tool No: " << int_value);
-                        gc_state.tool = int_value;
+                        gc_state.selected_tool = int_value;
                         break;
                     case 'X':
                         if (n_axis > X_AXIS) {
@@ -806,7 +939,7 @@ Error gc_execute_line(char* line) {
         if (gc_block.modal.feed_rate == FeedRate::InverseTime) {  // = G93
             // NOTE: G38 can also operate in inverse time, but is undefined as an error. Missing F word check added here.
             if (axis_command == AxisCommand::MotionMode) {
-                if ((gc_block.modal.motion != Motion::None) || (gc_block.modal.motion != Motion::Seek)) {
+                if ((gc_block.modal.motion != Motion::None) && (gc_block.modal.motion != Motion::Seek)) {
                     if (bitnum_is_false(value_words, GCodeWord::F)) {
                         FAIL(Error::GcodeUndefinedFeedRate);  // [F word missing]
                     }
@@ -880,6 +1013,58 @@ Error gc_execute_line(char* line) {
         clear_bitnum(value_words, GCodeWord::E);
         clear_bitnum(value_words, GCodeWord::Q);
     }
+    if ((gc_block.modal.io_control == IoControl::WaitOnInput)) {
+        // M66 P<digital input> L<wait mode type> Q<timeout>
+        // M66 E<analog input> L<wait mode type> Q<timeout>
+        // Exactly one of P or E must be present
+        if (bitnum_is_false(value_words, GCodeWord::P) && bitnum_is_false(value_words, GCodeWord::E)) {
+            // need at least one of P or E
+            FAIL(Error::GcodeValueWordMissing);
+        }
+        if (bitnum_is_true(value_words, GCodeWord::P) && bitnum_is_true(value_words, GCodeWord::E)) {
+            // need at most one of P or E
+            FAIL(Error::GcodeValueWordInvalid);
+        }
+        isWaitOnInputDigital = bitnum_is_true(value_words, GCodeWord::P);
+        clear_bitnum(value_words, GCodeWord::P);
+        clear_bitnum(value_words, GCodeWord::E);
+        if (bitnum_is_false(value_words, GCodeWord::L)) {
+            FAIL(Error::GcodeValueWordMissing);
+        }
+        clear_bitnum(value_words, GCodeWord::L);
+        auto const wait_mode = validate_wait_on_input_mode_value(gc_block.values.l);
+        if (!wait_mode) {
+            FAIL(Error::GcodeValueWordInvalid);
+        }
+        // Only Immediate mode is valid for analog input
+        if (!isWaitOnInputDigital && wait_mode != WaitOnInputMode::Immediate) {
+            FAIL(Error::GcodeValueWordInvalid);
+        }
+        // Q is the timeout in seconds (conditionally optional)
+        //  - Ignored if L is 0 (Immediate).
+        //  - Error if value 0 seconds, and L is not 0 (Immediate).
+        if (bitnum_is_true(value_words, GCodeWord::Q)) {
+            if (gc_block.values.q != 0.0) {
+                if (wait_mode != WaitOnInputMode::Immediate) {
+                    // Non-immediate waits must have a non-zero timeout
+                    FAIL(Error::GcodeValueWordInvalid);
+                }
+            }
+        } else {
+            if (wait_mode != WaitOnInputMode::Immediate) {
+                // Non-immediate waits must have a timeout
+                FAIL(Error::GcodeValueWordMissing);
+            }
+        }
+        clear_bitnum(value_words, GCodeWord::Q);
+    }
+    if (gc_block.modal.set_tool_number == SetToolNumber::Enable) {
+        if (bitnum_is_false(value_words, GCodeWord::Q)) {
+            FAIL(Error::GcodeValueWordMissing);
+        }
+        clear_bitnum(value_words, GCodeWord::Q);
+    }
+
     // [11. Set active plane ]: N/A
     switch (gc_block.modal.plane_select) {
         case Plane::XY:
@@ -1057,7 +1242,7 @@ Error gc_execute_line(char* line) {
                 case NonModal::GoHome0:  // G28
                 case NonModal::GoHome1:  // G30
                     // [G28/30 Errors]: Cutter compensation is enabled.
-                    // Retreive G28/30 go-home position data (in machine coordinates) from non-volatile storage
+                    // Retrieve G28/30 go-home position data (in machine coordinates) from non-volatile storage
                     if (gc_block.non_modal_command == NonModal::GoHome0) {
                         coords[CoordIndex::G28]->get(coord_data);
                     } else {  // == NonModal::GoHome1
@@ -1324,6 +1509,7 @@ Error gc_execute_line(char* line) {
                    (bitnum_to_mask(GCodeWord::X) | bitnum_to_mask(GCodeWord::Y) | bitnum_to_mask(GCodeWord::Z) |
                     bitnum_to_mask(GCodeWord::A) | bitnum_to_mask(GCodeWord::B) | bitnum_to_mask(GCodeWord::C)));  // Remove axis words.
     }
+    clear_bits(value_words, (bitnum_to_mask(GCodeWord::D) | bitnum_to_mask(GCodeWord::O)));
     if (value_words) {
         FAIL(Error::GcodeUnusedWords);  // [Unused words]
     }
@@ -1410,10 +1596,10 @@ Error gc_execute_line(char* line) {
     pl_data->feed_rate = gc_state.feed_rate;  // Record data for planner use.
     // [4. Set spindle speed ]:
     if ((gc_state.spindle_speed != gc_block.values.s) || syncLaser) {
-        if (gc_state.modal.spindle != SpindleState::Disable && !laserIsMotion && sys.state != State::CheckMode) {
+        if (gc_state.modal.spindle != SpindleState::Disable && !laserIsMotion && !state_is(State::CheckMode)) {
             protocol_buffer_synchronize();
             spindle->setState(gc_state.modal.spindle, disableLaser ? 0 : (uint32_t)gc_block.values.s);
-            report_ovr_counter = 0;  // Set to report change immediately
+            gc_ovr_changed();
         }
         gc_state.spindle_speed = gc_block.values.s;  // Update spindle speed state.
     }
@@ -1422,21 +1608,60 @@ Error gc_execute_line(char* line) {
         pl_data->spindle_speed = gc_state.spindle_speed;  // Record data for planner use.
     }                                                     // else { pl_data->spindle_speed = 0.0; } // Initialized as zero already.
     // [5. Select tool ]: NOT SUPPORTED. Only tracks tool value.
-    //	gc_state.tool = gc_block.values.t;
-    // [6. Change tool ]: NOT SUPPORTED
+    // [M6. Change tool ]:
     if (gc_block.modal.tool_change == ToolChange::Enable) {
-        user_tool_change(gc_state.tool);
+        if (gc_state.selected_tool != gc_state.current_tool) {
+            bool stopped_spindle = false;   // was spindle stopped via the change
+            bool new_spindle     = false;   // was the spindle changed
+            protocol_buffer_synchronize();  // wait for motion in buffer to finish
+
+            Spindles::Spindle::switchSpindle(
+                gc_state.selected_tool, Spindles::SpindleFactory::objects(), spindle, stopped_spindle, new_spindle);
+            if (stopped_spindle) {
+                gc_block.modal.spindle = SpindleState::Disable;
+            }
+            if (new_spindle) {
+                gc_state.spindle_speed = 0.0;
+            }
+            log_info("Sel:" << gc_state.selected_tool << " Cur:" << gc_state.current_tool);
+            spindle->tool_change(gc_state.selected_tool, false, false);
+            if (spindle->_atc_name == "" && spindle->_m6_macro.get().empty()) {  // if neither of these exist we need to set the value here
+                gc_state.current_tool = gc_state.selected_tool;
+            }
+            report_ovr_counter = 0;  // Set to report change immediately
+            gc_ovr_changed();
+        }
+    }
+    if (gc_block.modal.set_tool_number == SetToolNumber::Enable) {  // M61
+        if (gc_block.values.q < 0) {
+            FAIL(Error::NegativeValue);  // https://linuxcnc.org/docs/2.8/html/gcode/m-code.html#mcode:m61
+        }
+        gc_state.selected_tool = gc_block.values.q;
+        bool stopped_spindle   = false;  // was spindle stopped via the change
+        bool new_spindle       = false;  // was the spindle changed
+        protocol_buffer_synchronize();   // wait for motion in buffer to finish
+        Spindles::Spindle::switchSpindle(gc_state.selected_tool, Spindles::SpindleFactory::objects(), spindle, stopped_spindle, new_spindle);
+        if (stopped_spindle) {
+            gc_block.modal.spindle = SpindleState::Disable;
+        }
+        if (new_spindle) {
+            gc_state.spindle_speed = 0.0;
+        }
+        spindle->tool_change(gc_state.selected_tool, false, true);
+        gc_state.current_tool = gc_block.values.q;
+        report_ovr_counter    = 0;  // Set to report change immediately
+        gc_ovr_changed();
     }
     // [7. Spindle control ]:
     if (gc_state.modal.spindle != gc_block.modal.spindle) {
         // Update spindle control and apply spindle speed when enabling it in this block.
         // NOTE: All spindle state changes are synced, even in laser mode. Also, pl_data,
         // rather than gc_state, is used to manage laser state for non-laser motions.
-        if (sys.state != State::CheckMode) {
+        if (!state_is(State::CheckMode)) {
             protocol_buffer_synchronize();
             spindle->setState(gc_block.modal.spindle, (uint32_t)pl_data->spindle_speed);
         }
-        report_ovr_counter     = 0;  // Set to report change immediately
+        gc_ovr_changed();
         gc_state.modal.spindle = gc_block.modal.spindle;
     }
     pl_data->spindle = gc_state.modal.spindle;
@@ -1460,10 +1685,10 @@ Error gc_execute_line(char* line) {
                 gc_state.modal.coolant = {};
                 break;
         }
-        if (sys.state != State::CheckMode) {
+        if (!state_is(State::CheckMode)) {
             protocol_buffer_synchronize();
             config->_coolant->set_state(gc_state.modal.coolant);
-            report_ovr_counter = 0;  // Set to report change immediately
+            gc_ovr_changed();
         }
     }
 
@@ -1499,6 +1724,29 @@ Error gc_execute_line(char* line) {
         } else {
             FAIL(Error::PParamMaxExceeded);
         }
+    }
+    if (gc_block.modal.io_control == IoControl::WaitOnInput) {
+        auto const validate_input_number = [&](const float input_number) -> std::optional<uint8_t> {
+            if (input_number < 0) {
+                return std::nullopt;
+            }
+            if (isWaitOnInputDigital) {
+                if (input_number > MaxUserDigitalPin) {
+                    return std::nullopt;
+                } else if (input_number > MaxUserAnalogPin) {
+                    return std::nullopt;
+                }
+            }
+            return (uint8_t)input_number;
+        };
+        auto const maybe_input_number = validate_input_number(isWaitOnInputDigital ? gc_block.values.p : gc_block.values.e);
+        if (!maybe_input_number.has_value()) {
+            FAIL(Error::PParamMaxExceeded);
+        }
+        auto const input_number = *maybe_input_number;
+        auto const wait_mode    = *validate_wait_on_input_mode_value(gc_block.values.l);
+        auto const timeout      = gc_block.values.q;
+        gc_wait_on_input(isWaitOnInputDigital, input_number, wait_mode, timeout);
     }
 
     // [9. Override control ]: NOT SUPPORTED. Always enabled, except for parking control.
@@ -1548,10 +1796,10 @@ Error gc_execute_line(char* line) {
     switch (gc_block.non_modal_command) {
         case NonModal::SetCoordinateData:
             coords[coord_select]->set(coord_data);
+            gc_wco_changed();
             // Update system coordinate system if currently active.
             if (gc_state.modal.coord_select == coord_select) {
                 copyAxes(gc_state.coord_system, coord_data);
-                gc_wco_changed();
             }
             break;
         case NonModal::GoHome0:
@@ -1643,7 +1891,7 @@ Error gc_execute_line(char* line) {
             break;
         case ProgramFlow::Paused:
             protocol_buffer_synchronize();  // Sync and finish all remaining buffered motions before moving on.
-            if (sys.state != State::CheckMode) {
+            if (!state_is(State::CheckMode)) {
                 protocol_send_event(&feedHoldEvent);
                 protocol_execute_realtime();  // Execute suspend.
             }
@@ -1652,6 +1900,9 @@ Error gc_execute_line(char* line) {
         case ProgramFlow::CompletedM30:
             protocol_buffer_synchronize();  // Sync and finish all remaining buffered motions before moving on.
 
+            if (Job::active()) {
+                Job::channel()->end();
+            }
             // Upon program complete, only a subset of g-codes reset to certain defaults, according to
             // LinuxCNC's program end descriptions and testing. Only modal groups [G-code 1,2,3,5,7,12]
             // and [M-code 7,8,9] reset to [G1,G17,G90,G94,G40,G54,M5,M9,M48]. The remaining modal groups
@@ -1680,21 +1931,57 @@ Error gc_execute_line(char* line) {
             }
 
             // Execute coordinate change and spindle/coolant stop.
-            if (sys.state != State::CheckMode) {
+            if (!state_is(State::CheckMode)) {
                 coords[gc_state.modal.coord_select]->get(gc_state.coord_system);
                 gc_wco_changed();  // Set to refresh immediately just in case something altered.
                 spindle->spinDown();
                 config->_coolant->off();
-                report_ovr_counter = 0;  // Set to report changes immediately
+                gc_ovr_changed();
             }
             report_feedback_message(Message::ProgramEnd);
-            user_m30();
             break;
     }
     gc_state.modal.program_flow = ProgramFlow::Running;  // Reset program flow.
 
+    return perform_assignments() ? Error::Ok : Error::ParameterAssignmentFailed;
+
     // TODO: % to denote start of program.
-    return Error::Ok;
+}
+
+//void grbl_msg_sendf(uint8_t client, MsgLevel level, const char* format, ...);
+void gc_exec_linef(bool sync_after, Channel& out, const char* format, ...) {
+    if (sys.state != State::Idle && sys.state != State::Cycle) {
+        throw std::runtime_error("Invalid atate");
+    }
+
+    char    loc_buf[100];
+    char*   temp = loc_buf;
+    va_list arg;
+    va_list copy;
+    va_start(arg, format);
+    va_copy(copy, arg);
+    size_t len = vsnprintf(NULL, 0, format, arg);
+    va_end(copy);
+
+    if (len >= sizeof(loc_buf)) {
+        temp = new char[len + 1];
+        if (temp == NULL) {
+            return;
+        }
+    }
+    len = vsnprintf(temp, len + 1, format, arg);
+
+    //log_info("gc_exec_linef:" << temp);
+
+    gc_execute_line(temp);
+
+    va_end(arg);
+    if (temp != loc_buf) {
+        delete[] temp;
+    }
+    if (sync_after) {
+        protocol_buffer_synchronize();
+    }
 }
 
 /*
@@ -1722,9 +2009,47 @@ Error gc_execute_line(char* line) {
    group 13 = {G61.1, G64} path control mode (G61 is supported)
 */
 
-void WEAK_LINK user_m30() {}
+static std::optional<WaitOnInputMode> validate_wait_on_input_mode_value(uint8_t value) {
+    switch (value) {
+        case 0:
+            return WaitOnInputMode::Immediate;
+        case 1:
+            return WaitOnInputMode::Rise;
+        case 2:
+            return WaitOnInputMode::Fall;
+        case 3:
+            return WaitOnInputMode::High;
+        case 4:
+            return WaitOnInputMode::Low;
+        default:
+            return std::nullopt;
+    }
+}
 
-void WEAK_LINK user_tool_change(uint32_t new_tool) {
-    Spindles::Spindle::switchSpindle(new_tool, config->_spindles, spindle);
-    report_ovr_counter = 0;  // Set to report change immediately
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+
+static Error gc_wait_on_input(bool is_digital, uint8_t input_number, WaitOnInputMode mode, float timeout) {
+    // TODO - only Immediate read mode is supported
+    if (mode == WaitOnInputMode::Immediate) {
+        auto const result = is_digital ? config->_userInputs->readDigitalInput(input_number) :
+                                         config->_userInputs->readAnalogInput(input_number);
+        auto const on_ok  = [&](bool result) {
+            log_debug("M66: " << (is_digital ? "digital" : "analog") << "_input" << input_number << " result=" << result);
+            set_numbered_param(5399, result ? 1.0 : 0.0);
+            return Error::Ok;
+        };
+        auto const on_error = [&](Error error) {
+            log_error("M66: " << (is_digital ? "digital" : "analog") << "_input" << input_number << " failed");
+            return error;
+        };
+        return std::visit(overloaded { on_ok, on_error }, result);
+    }
+
+    // TODO - implement rest of modes
+    return Error::GcodeValueWordInvalid;
 }

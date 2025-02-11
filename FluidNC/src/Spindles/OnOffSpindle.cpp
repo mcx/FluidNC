@@ -1,7 +1,6 @@
 #include "OnOffSpindle.h"
 
 #include "../System.h"  // sys.abort
-#include "../Report.h"  // report_ovr_counter
 
 namespace Spindles {
 
@@ -24,12 +23,14 @@ namespace Spindles {
             linearSpeeds(1, 100.0f);
         }
         setupSpeeds(1);
+        init_atc();
         config_message();
     }
 
     // prints the startup message of the spindle config
     void OnOff ::config_message() {
-        log_info(name() << " Spindle Ena:" << _enable_pin.name() << " Out:" << _output_pin.name() << " Dir:" << _direction_pin.name());
+        log_info(name() << " Spindle Ena:" << _enable_pin.name() << " Out:" << _output_pin.name() << " Dir:" << _direction_pin.name()
+                        << atc_info());
     }
 
     void OnOff::setState(SpindleState state, SpindleSpeed speed) {
@@ -54,9 +55,13 @@ namespace Spindles {
         spindleDelay(state, speed);
     }
 
-    void IRAM_ATTR OnOff::set_output(uint32_t dev_speed) { _output_pin.synchronousWrite(dev_speed != 0); }
+    void IRAM_ATTR OnOff::set_output(uint32_t dev_speed) {
+        _output_pin.synchronousWrite(dev_speed != 0);
+    }
 
-    void IRAM_ATTR OnOff::setSpeedfromISR(uint32_t dev_speed) { set_output(dev_speed != 0); }
+    void IRAM_ATTR OnOff::setSpeedfromISR(uint32_t dev_speed) {
+        set_output(dev_speed != 0);
+    }
 
     void IRAM_ATTR OnOff::set_enable(bool enable) {
         if (_disable_with_zero_speed && sys.spindle_speed == 0) {
@@ -66,7 +71,9 @@ namespace Spindles {
         _enable_pin.synchronousWrite(enable);
     }
 
-    void OnOff::set_direction(bool Clockwise) { _direction_pin.synchronousWrite(Clockwise); }
+    void OnOff::set_direction(bool Clockwise) {
+        _direction_pin.synchronousWrite(Clockwise);
+    }
 
     void OnOff::deinit() {
         stop();

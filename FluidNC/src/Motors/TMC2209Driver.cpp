@@ -43,7 +43,8 @@ namespace MotorDrivers {
         // Run and hold current configuration items are in (float) Amps,
         // but the TMCStepper library expresses run current as (uint16_t) mA
         // and hold current as (float) fraction of run current.
-        uint16_t run_i = (uint16_t)(_run_current * 1000.0);
+        float    _mode_current = isHoming ? _homing_current : _run_current;
+        uint16_t run_i         = (uint16_t)(_mode_current * 1000.0);
 
         _cs_pin.synchronousWrite(true);
 
@@ -68,12 +69,10 @@ namespace MotorDrivers {
                 break;
             case TrinamicMode ::StallGuard:  //TODO: check all configurations for stallguard
             {
-                auto axisConfig     = config->_axes->_axis[this->axis_index()];
-                auto homingFeedRate = (axisConfig->_homing != nullptr) ? axisConfig->_homing->_feedRate : 200;
                 log_debug(axisName() << " Stallguard");
                 tmc2209->en_spreadCycle(false);
                 tmc2209->pwm_autoscale(true);
-                tmc2209->TCOOLTHRS(calc_tstep(homingFeedRate, 150.0));
+                tmc2209->TCOOLTHRS(calc_tstep(150));
                 tmc2209->SGTHRS(_stallguard);
                 break;
             }
@@ -114,13 +113,13 @@ namespace MotorDrivers {
     }
 
     void TMC2209Driver::set_disable(bool disable) {
-        _cs_pin.synchronousWrite(true);
         if (TrinamicUartDriver::startDisable(disable)) {
             if (_use_enable) {
+                _cs_pin.synchronousWrite(true);
                 tmc2209->toff(TrinamicUartDriver::toffValue());
+                _cs_pin.synchronousWrite(false);
             }
         }
-        _cs_pin.synchronousWrite(false);
     }
 
     bool TMC2209Driver::test() {

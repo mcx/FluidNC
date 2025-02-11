@@ -7,7 +7,9 @@
 #include "RealtimeCmd.h"            // execute_realtime_command
 #include "Limits.h"
 #include "Logging.h"
+#include "Job.h"
 #include <string_view>
+#include <algorithm>
 
 void Channel::flushRx() {
     _linelen   = 0;
@@ -78,7 +80,7 @@ uint32_t Channel::setReportInterval(uint32_t ms) {
     return actual;
 }
 static bool motionState() {
-    return sys.state == State::Cycle || sys.state == State::Homing || sys.state == State::Jog;
+    return state_is(State::Cycle) || state_is(State::Homing) || state_is(State::Jog);
 }
 
 void Channel::autoReportGCodeState() {
@@ -92,30 +94,34 @@ void Channel::autoReportGCodeState() {
         // Force the compare to succeed if the only change is the motion mode
         _lastModal.motion = gc_state.modal.motion;
     }
-    if (memcmp(&_lastModal, &gc_state.modal, sizeof(_lastModal)) || _lastTool != gc_state.tool ||
+    if (memcmp(&_lastModal, &gc_state.modal, sizeof(_lastModal)) || _lastTool != gc_state.selected_tool ||
         (!motionState() && (_lastSpindleSpeed != gc_state.spindle_speed || _lastFeedRate != gc_state.feed_rate))) {
         report_gcode_modes(*this);
         memcpy(&_lastModal, &gc_state.modal, sizeof(_lastModal));
-        _lastTool         = gc_state.tool;
+        _lastTool         = gc_state.selected_tool;
         _lastSpindleSpeed = gc_state.spindle_speed;
         _lastFeedRate     = gc_state.feed_rate;
     }
 }
 void Channel::autoReport() {
     if (_reportInterval) {
-        auto probeState = config->_probe->get_state();
-        if (probeState != _lastProbe) {
-            report_recompute_pin_string();
-        }
-        if (_reportWco || sys.state != _lastState || probeState != _lastProbe || _lastPinString != report_pin_string ||
-            (motionState() && (int32_t(xTaskGetTickCount()) - _nextReportTime) >= 0)) {
+        auto thisProbeState = config->_probe->get_state();
+        report_recompute_pin_string();
+        const char* stateName = state_name();
+        if (_reportOvr || _reportWco || stateName != _lastStateName || thisProbeState != _lastProbe || _lastPinString != report_pin_string ||
+            (motionState() && (int32_t(xTaskGetTickCount()) - _nextReportTime) >= 0) || (_lastJobActive != Job::active())) {
+            if (_reportOvr) {
+                report_ovr_counter = 0;
+                _reportOvr         = false;
+            }
             if (_reportWco) {
                 report_wco_counter = 0;
+                _reportWco         = false;
             }
-            _reportWco     = false;
-            _lastState     = sys.state;
-            _lastProbe     = probeState;
+            _lastStateName = stateName;
+            _lastProbe     = thisProbeState;
             _lastPinString = report_pin_string;
+            _lastJobActive = Job::active();
 
             _nextReportTime = xTaskGetTickCount() + _reportInterval;
             report_realtime_status(*this);
@@ -183,7 +189,7 @@ void Channel::push(uint8_t byte) {
     }
 }
 
-Channel* Channel::pollLine(char* line) {
+Error Channel::pollLine(char* line) {
     handle();
     while (1) {
         int ch = -1;
@@ -195,6 +201,7 @@ Channel* Channel::pollLine(char* line) {
             if (ch < 0) {
                 break;
             }
+            _active = true;
             if (realtimeOkay(ch) && is_realtime_command(ch)) {
                 handleRealtimeCharacter((uint8_t)ch);
                 continue;
@@ -207,13 +214,13 @@ Channel* Channel::pollLine(char* line) {
         }
 
         if (lineComplete(line, ch)) {
-            return this;
+            return Error::Ok;
         }
     }
     if (_active) {
         autoReport();
     }
-    return nullptr;
+    return Error::NoData;
 }
 
 void Channel::setAttr(int index, bool* value, const std::string& attrString, const char* tag) {
@@ -257,11 +264,12 @@ void Channel::ack(Error status) {
     // With verbose errors, the message text is displayed instead of the number.
     // Grbl 0.9 used to display the text, while Grbl 1.1 switched to the number.
     // Many senders support both formats.
-    LogStream msg(*this, "error:");
-    if (config->_verboseErrors) {
-        msg << errorString(status);
-    } else {
+    {
+        LogStream msg(*this, "error:");
         msg << static_cast<int>(status);
+    }
+    if (config->_verboseErrors) {
+        log_error_to(*this, errorString(status));
     }
 }
 
@@ -322,7 +330,7 @@ void Channel::sendLine(MsgLevel level, const std::string& line) {
     }
 }
 
-bool Channel::is_visible(const std::string& stem, const std::string& extension, bool isdir) {
+bool Channel::is_visible(const std::string& stem, std::string extension, bool isdir) {
     if (stem.length() && stem[0] == '.') {
         // Exclude hidden files and directories
         return false;
@@ -334,7 +342,12 @@ bool Channel::is_visible(const std::string& stem, const std::string& extension, 
     if (isdir) {
         return true;
     }
-    std::string_view extensions(_gcode_extensions);
+
+    // Convert extension to canonical lower case format
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    // common gcode extensions
+    std::string_view extensions(".g .gc .gco .gcode .nc .ngc .ncc .txt .cnc .tap");
     int              pos = 0;
     while (extensions.length()) {
         auto             next_pos       = extensions.find_first_of(' ', pos);
